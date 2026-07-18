@@ -12,9 +12,6 @@ const runtime = @import("runtime.zig");
 const server = @import("server.zig");
 const storage = @import("storage.zig");
 
-// The initial transport remains plain HTTP. Deployments should terminate TLS at a proxy.
-pub const std_options: std.Options = .{ .http_disable_tls = true };
-
 const AgentOptions = struct {
     server_url: []const u8,
     node_id: ?[]const u8,
@@ -88,7 +85,13 @@ fn defaultsForAgent(init: std.process.Init, file_config: config.FileConfig) !Age
     const default_role = init.environ_map.get("NIMBUS_ROLE") orelse file_config.role orelse "edge";
     const default_identity_file = init.environ_map.get("NIMBUS_NODE_ID_FILE") orelse
         file_config.node_id_file orelse ".nimbus-node-id";
-    const default_token = init.environ_map.get("NIMBUS_TOKEN") orelse file_config.token;
+    const default_token = try configuredToken(
+        init,
+        init.environ_map.get("NIMBUS_TOKEN"),
+        init.environ_map.get("NIMBUS_TOKEN_FILE"),
+        file_config.token,
+        file_config.token_file,
+    );
     const runtimes_text = init.environ_map.get("NIMBUS_RUNTIMES") orelse
         file_config.runtimes orelse "";
     const labels = try defaultLabels(init, file_config);
@@ -187,6 +190,9 @@ fn parseAgentOptions(
             options.max_artifact_bytes = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
         } else if (std.mem.eql(u8, arg, "--token")) {
             options.token = requireValue(init, args, &i, "--token");
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            options.token = readTokenFile(init, requireValue(init, args, &i, "--token-file")) catch
+                usageAndExit(init, "unable to read token file");
         } else if (std.mem.eql(u8, arg, "--once")) {
             options.once = true;
         } else if (std.mem.eql(u8, arg, "--config")) {
@@ -199,6 +205,7 @@ fn parseAgentOptions(
         if (!identity.isValid(value)) usageAndExit(init, "invalid node ID");
     }
     if (options.role.len == 0 or options.role.len > 64) usageAndExit(init, "invalid role");
+    validateAgentTiming(init, options);
     options.labels = labels.items;
     if (options.state_dir.len == 0) usageAndExit(init, "invalid state directory");
     if (options.max_artifact_bytes == 0) usageAndExit(init, "max artifact bytes must be positive");
@@ -257,8 +264,25 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
         "NIMBUS_STALE_AFTER_SECONDS",
         file_config.stale_after_seconds orelse 90,
     );
-    var token = init.environ_map.get("NIMBUS_TOKEN") orelse file_config.token;
-    var admin_token = init.environ_map.get("NIMBUS_ADMIN_TOKEN") orelse file_config.admin_token;
+    var token = try configuredToken(
+        init,
+        init.environ_map.get("NIMBUS_TOKEN"),
+        init.environ_map.get("NIMBUS_TOKEN_FILE"),
+        file_config.token,
+        file_config.token_file,
+    );
+    var admin_token = try configuredToken(
+        init,
+        init.environ_map.get("NIMBUS_ADMIN_TOKEN"),
+        init.environ_map.get("NIMBUS_ADMIN_TOKEN_FILE"),
+        file_config.admin_token,
+        file_config.admin_token_file,
+    );
+    var allow_insecure_no_auth = try config.envBool(
+        init,
+        "NIMBUS_ALLOW_INSECURE_NO_AUTH",
+        file_config.allow_insecure_no_auth orelse false,
+    );
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -274,14 +298,24 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
             stale_after = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
         } else if (std.mem.eql(u8, arg, "--token")) {
             token = requireValue(init, args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            token = readTokenFile(init, requireValue(init, args, &i, arg)) catch
+                usageAndExit(init, "unable to read token file");
         } else if (std.mem.eql(u8, arg, "--admin-token")) {
             admin_token = requireValue(init, args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--admin-token-file")) {
+            admin_token = readTokenFile(init, requireValue(init, args, &i, arg)) catch
+                usageAndExit(init, "unable to read admin token file");
+        } else if (std.mem.eql(u8, arg, "--allow-insecure-no-auth")) {
+            allow_insecure_no_auth = true;
         } else if (std.mem.eql(u8, arg, "--config")) {
             _ = requireValue(init, args, &i, arg);
         } else {
             usageAndExit(init, "unknown server option");
         }
     }
+    if (stale_after == 0 or stale_after > 30 * 24 * 60 * 60)
+        usageAndExit(init, "stale-after must be between 1 second and 30 days");
     try server.serve(init, .{
         .bind_address = bind_address,
         .port = port,
@@ -289,6 +323,7 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
         .stale_after_seconds = stale_after,
         .token = token,
         .admin_token = admin_token,
+        .allow_insecure_no_auth = allow_insecure_no_auth,
     });
 }
 
@@ -300,10 +335,10 @@ fn runNodes(
 ) !void {
     var server_url = init.environ_map.get("NIMBUS_SERVER") orelse
         file_config.server orelse "http://127.0.0.1:8080";
-    var token = init.environ_map.get("NIMBUS_ADMIN_TOKEN") orelse
-        init.environ_map.get("NIMBUS_TOKEN") orelse
-        file_config.admin_token orelse file_config.token;
+    var token = try operatorToken(init, file_config);
     var node_id: ?[]const u8 = null;
+    var limit: u16 = 100;
+    var after: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -312,6 +347,16 @@ fn runNodes(
             server_url = requireValue(init, args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--token")) {
             token = requireValue(init, args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            token = readTokenFile(init, requireValue(init, args, &i, arg)) catch
+                usageAndExit(init, "unable to read token file");
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            limit = std.fmt.parseInt(u16, requireValue(init, args, &i, arg), 10) catch
+                usageAndExit(init, "invalid node list limit");
+            if (limit == 0 or limit > 500) usageAndExit(init, "node list limit must be 1..500");
+        } else if (std.mem.eql(u8, arg, "--after")) {
+            after = requireValue(init, args, &i, arg);
+            if (!identity.isValid(after.?)) usageAndExit(init, "invalid node cursor");
         } else if (std.mem.eql(u8, arg, "--config")) {
             _ = requireValue(init, args, &i, arg);
         } else if (!std.mem.startsWith(u8, arg, "--") and node_id == null) {
@@ -323,7 +368,14 @@ fn runNodes(
 
     const trimmed = std.mem.trimEnd(u8, server_url, "/");
     const url = if (std.mem.eql(u8, subcommand, "list"))
-        try std.fmt.allocPrint(init.gpa, "{s}/v1/nodes", .{trimmed})
+        if (after) |cursor|
+            try std.fmt.allocPrint(
+                init.gpa,
+                "{s}/v1/nodes?limit={d}&after={s}",
+                .{ trimmed, limit, cursor },
+            )
+        else
+            try std.fmt.allocPrint(init.gpa, "{s}/v1/nodes?limit={d}", .{ trimmed, limit })
     else if (std.mem.eql(u8, subcommand, "inspect")) blk: {
         const value = node_id orelse usageAndExit(init, "nodes inspect requires a node ID");
         if (!identity.isValid(value)) usageAndExit(init, "invalid node ID");
@@ -356,9 +408,7 @@ fn runDeployments(
 ) !void {
     var server_url = init.environ_map.get("NIMBUS_SERVER") orelse
         file_config.server orelse "http://127.0.0.1:8080";
-    var token = init.environ_map.get("NIMBUS_ADMIN_TOKEN") orelse
-        init.environ_map.get("NIMBUS_TOKEN") orelse
-        file_config.admin_token orelse file_config.token;
+    var token = try operatorToken(init, file_config);
     var operand: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -368,6 +418,9 @@ fn runDeployments(
             server_url = requireValue(init, args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--token")) {
             token = requireValue(init, args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--token-file")) {
+            token = readTokenFile(init, requireValue(init, args, &i, arg)) catch
+                usageAndExit(init, "unable to read token file");
         } else if (std.mem.eql(u8, arg, "--config")) {
             _ = requireValue(init, args, &i, arg);
         } else if (!std.mem.startsWith(u8, arg, "--") and operand == null) {
@@ -435,6 +488,55 @@ fn readFileAlloc(init: std.process.Init, path: []const u8, maximum: usize) ![]u8
     var buffer: [4096]u8 = undefined;
     var reader = file.reader(init.io, &buffer);
     return reader.interface.allocRemaining(init.gpa, .limited(maximum));
+}
+
+fn readTokenFile(init: std.process.Init, path: []const u8) ![]const u8 {
+    const bytes = try readFileAlloc(init, path, 64 * 1024);
+    defer init.gpa.free(bytes);
+    const token = std.mem.trim(u8, bytes, " \t\r\n");
+    if (token.len == 0 or token.len > 4096) return error.InvalidTokenFile;
+    return init.arena.allocator().dupe(u8, token);
+}
+
+fn configuredToken(
+    init: std.process.Init,
+    environment_token: ?[]const u8,
+    environment_file: ?[]const u8,
+    config_token: ?[]const u8,
+    config_file: ?[]const u8,
+) !?[]const u8 {
+    if (environment_token) |value| return value;
+    if (environment_file) |path| return try readTokenFile(init, path);
+    if (config_token) |value| return value;
+    if (config_file) |path| return try readTokenFile(init, path);
+    return null;
+}
+
+fn operatorToken(init: std.process.Init, file_config: config.FileConfig) !?[]const u8 {
+    if (init.environ_map.get("NIMBUS_ADMIN_TOKEN")) |value| return value;
+    if (init.environ_map.get("NIMBUS_ADMIN_TOKEN_FILE")) |path| return try readTokenFile(init, path);
+    if (init.environ_map.get("NIMBUS_TOKEN")) |value| return value;
+    if (init.environ_map.get("NIMBUS_TOKEN_FILE")) |path| return try readTokenFile(init, path);
+    if (file_config.admin_token) |value| return value;
+    if (file_config.admin_token_file) |path| return try readTokenFile(init, path);
+    if (file_config.token) |value| return value;
+    if (file_config.token_file) |path| return try readTokenFile(init, path);
+    return null;
+}
+
+fn validateAgentTiming(init: std.process.Init, options: AgentOptions) void {
+    if (options.interval_seconds == 0 or options.interval_seconds > 24 * 60 * 60)
+        usageAndExit(init, "interval must be between 1 second and 24 hours");
+    if (options.jitter_seconds > 60 * 60)
+        usageAndExit(init, "jitter must be at most 1 hour");
+    if (options.jitter_seconds > options.interval_seconds)
+        usageAndExit(init, "jitter must not exceed interval");
+    if (options.retry_initial_seconds == 0 or options.retry_initial_seconds > 10 * 60)
+        usageAndExit(init, "retry-initial must be between 1 second and 10 minutes");
+    if (options.retry_max_seconds == 0 or options.retry_max_seconds > 60 * 60)
+        usageAndExit(init, "retry-max must be between 1 second and 1 hour");
+    if (options.retry_initial_seconds > options.retry_max_seconds)
+        usageAndExit(init, "retry-initial must not exceed retry-max");
 }
 
 fn writeControlResponse(init: std.process.Init, result: client.SendResult) !void {
@@ -519,28 +621,34 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\Usage:
         \\  nimbus agent inspect [--id ID] [--identity-file PATH] [--role ROLE] [--label KEY=VALUE]
         \\  nimbus agent run [--server URL] [--interval SEC] [--jitter SEC]
-        \\                   [--retry-initial SEC] [--retry-max SEC] [--token TOKEN]
+        \\                   [--retry-initial SEC] [--retry-max SEC] [--once]
+        \\                   [--token TOKEN | --token-file PATH]
         \\                   [--label KEY=VALUE] [--orchestrate] [--runtimes CSV]
         \\                   [--state-dir PATH]
         \\                   [--artifact-public-key HEX] [--require-artifact-signatures]
         \\  nimbus server [--bind ADDRESS] [--port PORT] [--database PATH]
-        \\                [--stale-after SEC] [--token TOKEN] [--admin-token TOKEN]
-        \\  nimbus nodes list [--server URL] [--token TOKEN]
-        \\  nimbus nodes inspect NODE_ID [--server URL] [--token TOKEN]
-        \\  nimbus deployments apply FILE [--server URL] [--token TOKEN]
-        \\  nimbus deployments list [--server URL] [--token TOKEN]
-        \\  nimbus deployments inspect NAME [--server URL] [--token TOKEN]
-        \\  nimbus deployments delete NAME [--server URL] [--token TOKEN]
-        \\  nimbus deployments rollback NAME [--server URL] [--token TOKEN]
+        \\                [--stale-after SEC] [--token TOKEN | --token-file PATH]
+        \\                [--admin-token TOKEN | --admin-token-file PATH]
+        \\                [--allow-insecure-no-auth]
+        \\  nimbus nodes list [--server URL] [--limit N] [--after NODE_ID]
+        \\                    [--token TOKEN | --token-file PATH]
+        \\  nimbus nodes inspect NODE_ID [--server URL] [--token TOKEN | --token-file PATH]
+        \\  nimbus deployments apply FILE [--server URL] [--token TOKEN | --token-file PATH]
+        \\  nimbus deployments list [--server URL] [--token TOKEN | --token-file PATH]
+        \\  nimbus deployments inspect NAME [--server URL] [--token TOKEN | --token-file PATH]
+        \\  nimbus deployments delete NAME [--server URL] [--token TOKEN | --token-file PATH]
+        \\  nimbus deployments rollback NAME [--server URL] [--token TOKEN | --token-file PATH]
         \\  nimbus version
         \\
         \\All operational commands accept --config PATH. Environment overrides use
-        \\NIMBUS_SERVER, NIMBUS_TOKEN, NIMBUS_NODE_ID, NIMBUS_NODE_ID_FILE,
+        \\NIMBUS_SERVER, NIMBUS_TOKEN, NIMBUS_TOKEN_FILE, NIMBUS_NODE_ID,
+        \\NIMBUS_NODE_ID_FILE,
         \\NIMBUS_ROLE, NIMBUS_LABELS, NIMBUS_INTERVAL_SECONDS, NIMBUS_JITTER_SECONDS,
         \\NIMBUS_DATABASE, NIMBUS_BIND, NIMBUS_PORT, NIMBUS_STALE_AFTER_SECONDS,
         \\NIMBUS_ORCHESTRATION, NIMBUS_RUNTIMES, NIMBUS_STATE_DIR,
         \\NIMBUS_ARTIFACT_PUBLIC_KEY, NIMBUS_REQUIRE_ARTIFACT_SIGNATURES,
-        \\NIMBUS_MAX_ARTIFACT_BYTES, and NIMBUS_ADMIN_TOKEN.
+        \\NIMBUS_MAX_ARTIFACT_BYTES, NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE,
+        \\and NIMBUS_ALLOW_INSECURE_NO_AUTH.
         \\
     ) catch {};
     std.process.exit(if (message == null) 0 else 2);

@@ -9,6 +9,8 @@ const storage = @import("storage.zig");
 const max_heartbeat_bytes = 64 * 1024;
 const max_deployment_bytes = 1024 * 1024;
 const max_status_bytes = 64 * 1024;
+const max_concurrent_connections = 64;
+const request_timeout_seconds = 15;
 const json_header = [_]std.http.Header{
     .{ .name = "content-type", .value = "application/json" },
 };
@@ -20,10 +22,14 @@ pub const Options = struct {
     stale_after_seconds: u64,
     token: ?[]const u8,
     admin_token: ?[]const u8,
+    allow_insecure_no_auth: bool = false,
 };
 
 pub fn serve(init: std.process.Init, options: Options) !void {
     if (options.stale_after_seconds == 0) return error.InvalidStaleTimeout;
+    if (options.token == null and !isLoopbackBind(options.bind_address) and
+        !options.allow_insecure_no_auth)
+        return error.AuthenticationRequired;
     if (!std.mem.eql(u8, options.database_path, ":memory:")) {
         if (std.fs.path.dirname(options.database_path)) |parent| {
             if (parent.len > 0) try Io.Dir.cwd().createDirPath(init.io, parent);
@@ -38,6 +44,7 @@ pub fn serve(init: std.process.Init, options: Options) !void {
     defer listener.deinit(init.io);
     var connections: Io.Group = .init;
     defer connections.cancel(init.io);
+    var connection_permits: Io.Semaphore = .{ .permits = max_concurrent_connections };
 
     shutdown.install();
     var shutdown_monitor = try init.io.concurrent(shutdownListener, .{ init.io, &listener });
@@ -57,12 +64,18 @@ pub fn serve(init: std.process.Init, options: Options) !void {
             error.Canceled => if (shutdown.isRequested()) break else return err,
             else => return err,
         };
+        connection_permits.wait(init.io) catch |err| {
+            stream.close(init.io);
+            return err;
+        };
         connections.concurrent(init.io, handleConnectionTask, .{
             init,
             &registry,
             options,
             stream,
+            &connection_permits,
         }) catch |err| {
+            connection_permits.post(init.io);
             stream.close(init.io);
             const message = try std.fmt.allocPrint(init.gpa, "unable to start request task: {t}\n", .{err});
             defer init.gpa.free(message);
@@ -77,7 +90,9 @@ fn handleConnectionTask(
     registry: *storage.Registry,
     options: Options,
     stream: Io.net.Stream,
+    connection_permits: *Io.Semaphore,
 ) Io.Cancelable!void {
+    defer connection_permits.post(init.io);
     handleConnection(init, registry, options, stream) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         const message = std.fmt.allocPrint(init.gpa, "request failed: {t}\n", .{err}) catch return;
@@ -108,6 +123,8 @@ fn handleConnection(
     stream: Io.net.Stream,
 ) !void {
     defer stream.close(init.io);
+    var deadline = try init.io.concurrent(closeAfterDeadline, .{ init.io, stream });
+    defer _ = deadline.cancel(init.io) catch {};
 
     var recv_buffer: [8192]u8 = undefined;
     var send_buffer: [8192]u8 = undefined;
@@ -118,6 +135,11 @@ fn handleConnection(
 
     if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/healthz")) {
         return respondJson(&request, "{\"status\":\"ok\"}\n", .ok);
+    }
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/readyz")) {
+        if (try registry.ready())
+            return respondJson(&request, "{\"status\":\"ready\"}\n", .ok);
+        return respondJson(&request, "{\"status\":\"not_ready\"}\n", .service_unavailable);
     }
 
     if (!isAuthorized(&request, requiredToken(options, request.head.target))) {
@@ -190,9 +212,17 @@ fn handleConnection(
         return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
     }
 
-    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/v1/nodes")) {
+    const node_page = parseNodeListTarget(request.head.target) catch
+        return respondJson(&request, "{\"error\":\"invalid_pagination\"}\n", .bad_request);
+    if (request.head.method == .GET and node_page != null) {
         const now = Io.Clock.real.now(init.io).toMilliseconds();
-        const response = try registry.listNodes(now, staleMillis(options.stale_after_seconds));
+        const page = node_page.?;
+        const response = try registry.listNodes(
+            now,
+            staleMillis(options.stale_after_seconds),
+            page.limit,
+            page.after,
+        );
         defer init.gpa.free(response);
         return respondJson(&request, response, .ok);
     }
@@ -211,6 +241,55 @@ fn handleConnection(
     }
 
     return respondJson(&request, "{\"error\":\"not_found\"}\n", .not_found);
+}
+
+fn closeAfterDeadline(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
+    const duration: Io.Clock.Duration = .{
+        .clock = .boot,
+        .raw = .fromSeconds(request_timeout_seconds),
+    };
+    try duration.sleep(io);
+    stream.shutdown(io, .both) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {},
+    };
+}
+
+fn isLoopbackBind(address: []const u8) bool {
+    return std.mem.eql(u8, address, "::1") or
+        std.mem.eql(u8, address, "localhost") or
+        std.mem.startsWith(u8, address, "127.");
+}
+
+const NodePage = struct {
+    limit: u16 = 100,
+    after: ?[]const u8 = null,
+};
+
+fn parseNodeListTarget(target: []const u8) !?NodePage {
+    const path = "/v1/nodes";
+    if (std.mem.eql(u8, target, path)) return .{};
+    if (!std.mem.startsWith(u8, target, path ++ "?")) return null;
+
+    var page: NodePage = .{};
+    var seen_limit = false;
+    var seen_after = false;
+    var fields = std.mem.splitScalar(u8, target[path.len + 1 ..], '&');
+    while (fields.next()) |field| {
+        const separator = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidQuery;
+        const key = field[0..separator];
+        const value = field[separator + 1 ..];
+        if (std.mem.eql(u8, key, "limit") and !seen_limit) {
+            page.limit = try std.fmt.parseInt(u16, value, 10);
+            if (page.limit == 0 or page.limit > 500) return error.InvalidLimit;
+            seen_limit = true;
+        } else if (std.mem.eql(u8, key, "after") and !seen_after) {
+            if (!identity.isValid(value)) return error.InvalidCursor;
+            page.after = value;
+            seen_after = true;
+        } else return error.InvalidQuery;
+    }
+    return page;
 }
 
 fn ingestDeployment(
@@ -427,4 +506,25 @@ test "operator routes prefer a separate administrative token" {
         "admin-token",
         requiredToken(options, "/v1/deployments").?,
     );
+}
+
+test "only loopback binds may start without authentication by default" {
+    try std.testing.expect(isLoopbackBind("127.0.0.1"));
+    try std.testing.expect(isLoopbackBind("127.42.0.1"));
+    try std.testing.expect(isLoopbackBind("::1"));
+    try std.testing.expect(!isLoopbackBind("0.0.0.0"));
+    try std.testing.expect(!isLoopbackBind("192.168.1.10"));
+}
+
+test "node list pagination is bounded and validates cursors" {
+    const default_page = (try parseNodeListTarget("/v1/nodes")).?;
+    try std.testing.expectEqual(@as(u16, 100), default_page.limit);
+    try std.testing.expect(default_page.after == null);
+
+    const page = (try parseNodeListTarget("/v1/nodes?limit=25&after=edge-01")).?;
+    try std.testing.expectEqual(@as(u16, 25), page.limit);
+    try std.testing.expectEqualStrings("edge-01", page.after.?);
+    try std.testing.expectError(error.InvalidLimit, parseNodeListTarget("/v1/nodes?limit=0"));
+    try std.testing.expectError(error.InvalidLimit, parseNodeListTarget("/v1/nodes?limit=501"));
+    try std.testing.expectError(error.InvalidCursor, parseNodeListTarget("/v1/nodes?after=bad/id"));
 }

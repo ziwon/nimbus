@@ -35,9 +35,7 @@ pub fn collect(
     role: []const u8,
     labels: []const Label,
 ) Heartbeat {
-    const hostname = init.environ_map.get("HOSTNAME") orelse
-        init.environ_map.get("COMPUTERNAME") orelse
-        "unknown";
+    const hostname = detectHostname(init);
 
     return .{
         .node_id = node_id,
@@ -54,6 +52,19 @@ pub fn collect(
         },
         .timestamp_unix_ms = std.Io.Clock.real.now(init.io).toMilliseconds(),
     };
+}
+
+fn detectHostname(init: std.process.Init) []const u8 {
+    if (init.environ_map.get("HOSTNAME") orelse init.environ_map.get("COMPUTERNAME")) |value|
+        return value;
+    switch (builtin.target.os.tag) {
+        .linux, .macos => {
+            var buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const value = std.posix.gethostname(&buffer) catch return "unknown";
+            return init.arena.allocator().dupe(u8, value) catch "unknown";
+        },
+        else => return "unknown",
+    }
 }
 
 pub fn serializeAlloc(allocator: std.mem.Allocator, value: Heartbeat) ![]u8 {

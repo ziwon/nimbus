@@ -16,11 +16,14 @@ pub const FileConfig = struct {
     require_artifact_signatures: ?bool = null,
     max_artifact_bytes: ?u64 = null,
     token: ?[]const u8 = null,
+    token_file: ?[]const u8 = null,
     admin_token: ?[]const u8 = null,
+    admin_token_file: ?[]const u8 = null,
     bind: ?[]const u8 = null,
     port: ?u16 = null,
     database: ?[]const u8 = null,
     stale_after_seconds: ?u64 = null,
+    allow_insecure_no_auth: ?bool = null,
 };
 
 pub fn load(init: std.process.Init, path: []const u8) !FileConfig {

@@ -22,8 +22,11 @@ pub const Options = struct {
 
 pub fn run(init: std.process.Init, options: Options) !void {
     if (options.interval_seconds == 0) return error.InvalidInterval;
+    if (options.interval_seconds > 24 * 60 * 60 or options.jitter_seconds > 60 * 60 or
+        options.jitter_seconds > options.interval_seconds) return error.InvalidInterval;
     if (options.retry_initial_seconds == 0 or options.retry_max_seconds == 0) return error.InvalidRetry;
-    if (options.retry_initial_seconds > options.retry_max_seconds) return error.InvalidRetry;
+    if (options.retry_initial_seconds > 10 * 60 or options.retry_max_seconds > 60 * 60 or
+        options.retry_initial_seconds > options.retry_max_seconds) return error.InvalidRetry;
 
     const endpoint = try endpointAlloc(init.gpa, options.server);
     defer init.gpa.free(endpoint);
@@ -47,11 +50,11 @@ pub fn run(init: std.process.Init, options: Options) !void {
                 }) catch |err| try log(init, "reconciliation failed: {t}\n", .{err});
             }
             if (options.once) return;
-            const delay = options.interval_seconds + randomJitter(init.io, options.jitter_seconds);
-            try shutdown.sleepInterruptible(init.io, delay * 1000);
+            const delay = options.interval_seconds +| randomJitter(init.io, options.jitter_seconds);
+            try shutdown.sleepInterruptible(init.io, delay *| 1000);
         } else {
             if (options.once) return error.HeartbeatRejected;
-            try shutdown.sleepInterruptible(init.io, backoff * 1000);
+            try shutdown.sleepInterruptible(init.io, backoff *| 1000);
             backoff = nextBackoff(backoff, options.retry_max_seconds);
         }
     }

@@ -5,6 +5,10 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+const heartbeat_sample_ms: i64 = 5 * 60 * 1000;
+const heartbeat_retention_ms: i64 = 7 * 24 * 60 * 60 * 1000;
+const audit_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
+
 pub const Registry = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
@@ -18,7 +22,10 @@ pub const Registry = struct {
         var db_optional: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
         if (c.sqlite3_open_v2(path_z.ptr, &db_optional, flags, null) != c.SQLITE_OK) {
-            if (db_optional) |db| _ = c.sqlite3_close(db);
+            if (db_optional) |db| {
+                logSqliteError(db, "open");
+                _ = c.sqlite3_close(db);
+            }
             return error.SqliteOpenFailed;
         }
 
@@ -34,6 +41,14 @@ pub const Registry = struct {
     pub fn close(self: *Registry) void {
         _ = c.sqlite3_close(self.db);
         self.* = undefined;
+    }
+
+    pub fn ready(self: *Registry) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var statement = try self.prepare("SELECT 1;");
+        defer statement.finalize();
+        return try statement.row() and statement.columnInt64(0) == 1;
     }
 
     fn migrate(self: *Registry) !void {
@@ -146,6 +161,25 @@ pub const Registry = struct {
     ) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        var enrolled = true;
+        var latest_history: ?i64 = null;
+        {
+            var current = try self.prepare("SELECT 1 FROM nodes WHERE node_id=?;");
+            defer current.finalize();
+            try current.bindText(1, report.node_id);
+            enrolled = !try current.row();
+        }
+        {
+            var latest = try self.prepare(
+                "SELECT MAX(received_unix_ms) FROM heartbeat_history WHERE node_id=?;",
+            );
+            defer latest.finalize();
+            try latest.bindText(1, report.node_id);
+            if (try latest.row() and !latest.columnIsNull(0)) latest_history = latest.columnInt64(0);
+        }
+        const sample_history = latest_history == null or
+            received_unix_ms -| latest_history.? >= heartbeat_sample_ms;
+
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
 
@@ -194,36 +228,60 @@ pub const Registry = struct {
             try insert_label.done();
         }
 
-        var history = try self.prepare(
-            "INSERT INTO heartbeat_history " ++
-                "(node_id, received_unix_ms, reported_unix_ms, report_json) VALUES (?, ?, ?, ?);",
-        );
-        defer history.finalize();
-        try history.bindText(1, report.node_id);
-        try history.bindInt64(2, received_unix_ms);
-        try history.bindInt64(3, report.timestamp_unix_ms);
-        try history.bindText(4, report_json);
-        try history.done();
+        if (sample_history) {
+            var history = try self.prepare(
+                "INSERT INTO heartbeat_history " ++
+                    "(node_id, received_unix_ms, reported_unix_ms, report_json) VALUES (?, ?, ?, ?);",
+            );
+            defer history.finalize();
+            try history.bindText(1, report.node_id);
+            try history.bindInt64(2, received_unix_ms);
+            try history.bindInt64(3, report.timestamp_unix_ms);
+            try history.bindText(4, report_json);
+            try history.done();
 
-        try self.audit(received_unix_ms, report.node_id, "heartbeat.accepted", report.agent_version);
+            var prune_history = try self.prepare(
+                "DELETE FROM heartbeat_history WHERE received_unix_ms < ?;",
+            );
+            defer prune_history.finalize();
+            try prune_history.bindInt64(1, received_unix_ms -| heartbeat_retention_ms);
+            try prune_history.done();
+        }
+        if (enrolled) try self.audit(received_unix_ms, report.node_id, "node.enrolled", report.agent_version);
         try self.exec("COMMIT;");
     }
 
-    pub fn listNodes(self: *Registry, now_unix_ms: i64, stale_after_ms: i64) ![]u8 {
+    pub fn listNodes(
+        self: *Registry,
+        now_unix_ms: i64,
+        stale_after_ms: i64,
+        limit: u16,
+        after: ?[]const u8,
+    ) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var statement = try self.prepare(
             \\SELECT node_id, hostname, role, os, arch, abi, cpu_count,
             \\       agent_version, last_seen_unix_ms
-            \\FROM nodes ORDER BY node_id;
+            \\FROM nodes WHERE node_id > ? ORDER BY node_id LIMIT ?;
         );
         defer statement.finalize();
+        try statement.bindText(1, after orelse "");
+        try statement.bindInt64(2, @as(i64, limit) + 1);
 
         var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(self.allocator);
-        try output.append(self.allocator, '[');
+        try output.appendSlice(self.allocator, "{\"items\":[");
         var first = true;
+        var count: usize = 0;
+        var has_more = false;
+        var next_after: ?[]u8 = null;
+        defer if (next_after) |value| self.allocator.free(value);
         while (try statement.row()) {
+            if (count == limit) {
+                has_more = true;
+                break;
+            }
             const summary: NodeSummary = .{
                 .node_id = statement.columnText(0),
                 .hostname = statement.columnText(1),
@@ -243,8 +301,19 @@ pub const Registry = struct {
             if (!first) try output.append(self.allocator, ',');
             first = false;
             try output.appendSlice(self.allocator, item);
+            if (next_after) |value| self.allocator.free(value);
+            next_after = try self.allocator.dupe(u8, summary.node_id);
+            count += 1;
         }
-        try output.appendSlice(self.allocator, "]\n");
+        try output.appendSlice(self.allocator, "],\"next_after\":");
+        if (has_more) {
+            const cursor = try std.json.Stringify.valueAlloc(self.allocator, next_after.?, .{});
+            defer self.allocator.free(cursor);
+            try output.appendSlice(self.allocator, cursor);
+        } else {
+            try output.appendSlice(self.allocator, "null");
+        }
+        try output.appendSlice(self.allocator, "}\n");
         return try output.toOwnedSlice(self.allocator);
     }
 
@@ -641,7 +710,6 @@ pub const Registry = struct {
             try self.maybeAdvanceRollout(report.deployment, received_unix_ms);
         }
 
-        try self.audit(received_unix_ms, report.node_id, "workload.status", @tagName(report.state));
         try self.exec("COMMIT;");
         return true;
     }
@@ -904,6 +972,11 @@ pub const Registry = struct {
         action: []const u8,
         detail: []const u8,
     ) !void {
+        var prune = try self.prepare("DELETE FROM audit_events WHERE created_unix_ms < ?;");
+        defer prune.finalize();
+        try prune.bindInt64(1, timestamp -| audit_retention_ms);
+        try prune.done();
+
         var statement = try self.prepare(
             "INSERT INTO audit_events (created_unix_ms, node_id, action, detail) VALUES (?, ?, ?, ?);",
         );
@@ -916,14 +989,19 @@ pub const Registry = struct {
     }
 
     fn exec(self: *Registry, sql: [*:0]const u8) !void {
-        if (c.sqlite3_exec(self.db, sql, null, null, null) != c.SQLITE_OK) return error.SqliteExecFailed;
+        if (c.sqlite3_exec(self.db, sql, null, null, null) != c.SQLITE_OK) {
+            logSqliteError(self.db, "exec");
+            return error.SqliteExecFailed;
+        }
     }
 
     fn prepare(self: *Registry, sql: []const u8) !Statement {
         var optional: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &optional, null) != c.SQLITE_OK)
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &optional, null) != c.SQLITE_OK) {
+            logSqliteError(self.db, "prepare");
             return error.SqlitePrepareFailed;
-        return .{ .handle = optional.? };
+        }
+        return .{ .handle = optional.?, .db = self.db };
     }
 };
 
@@ -958,6 +1036,7 @@ const AssignmentSummary = struct {
 
 const Statement = struct {
     handle: *c.sqlite3_stmt,
+    db: *c.sqlite3,
 
     fn finalize(self: *Statement) void {
         _ = c.sqlite3_finalize(self.handle);
@@ -965,24 +1044,34 @@ const Statement = struct {
     }
 
     fn bindText(self: *Statement, index: c_int, value: []const u8) !void {
-        if (c.sqlite3_bind_text(self.handle, index, value.ptr, @intCast(value.len), null) != c.SQLITE_OK)
+        if (c.sqlite3_bind_text(self.handle, index, value.ptr, @intCast(value.len), null) != c.SQLITE_OK) {
+            logSqliteError(self.db, "bind text");
             return error.SqliteBindFailed;
+        }
     }
 
     fn bindInt64(self: *Statement, index: c_int, value: i64) !void {
-        if (c.sqlite3_bind_int64(self.handle, index, value) != c.SQLITE_OK)
+        if (c.sqlite3_bind_int64(self.handle, index, value) != c.SQLITE_OK) {
+            logSqliteError(self.db, "bind integer");
             return error.SqliteBindFailed;
+        }
     }
 
     fn done(self: *Statement) !void {
-        if (c.sqlite3_step(self.handle) != c.SQLITE_DONE) return error.SqliteStepFailed;
+        if (c.sqlite3_step(self.handle) != c.SQLITE_DONE) {
+            logSqliteError(self.db, "step");
+            return error.SqliteStepFailed;
+        }
     }
 
     fn row(self: *Statement) !bool {
         return switch (c.sqlite3_step(self.handle)) {
             c.SQLITE_ROW => true,
             c.SQLITE_DONE => false,
-            else => error.SqliteStepFailed,
+            else => {
+                logSqliteError(self.db, "row step");
+                return error.SqliteStepFailed;
+            },
         };
     }
 
@@ -1001,6 +1090,11 @@ const Statement = struct {
         return c.sqlite3_column_type(self.handle, index) == c.SQLITE_NULL;
     }
 };
+
+fn logSqliteError(db: *c.sqlite3, operation: []const u8) void {
+    const message = std.mem.span(c.sqlite3_errmsg(db));
+    std.log.err("SQLite {s} failed: {s}", .{ operation, message });
+}
 
 fn status(now_unix_ms: i64, last_seen_unix_ms: i64, stale_after_ms: i64) []const u8 {
     return if (now_unix_ms - last_seen_unix_ms > stale_after_ms) "stale" else "online";
@@ -1021,10 +1115,71 @@ test "SQLite registry persists and marks nodes stale" {
     defer std.testing.allocator.free(json);
     try registry.recordHeartbeat(report, json, 1000);
 
-    const nodes = try registry.listNodes(4001, 3000);
+    const nodes = try registry.listNodes(4001, 3000, 100, null);
     defer std.testing.allocator.free(nodes);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"node_id\":\"edge-01\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"status\":\"stale\"") != null);
+}
+
+test "heartbeat history is sampled and enrollment audit is not duplicated" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const report: heartbeat.Heartbeat = .{
+        .node_id = "edge-01",
+        .hostname = "edge-01",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    const json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+    defer std.testing.allocator.free(json);
+
+    try registry.recordHeartbeat(report, json, 1000);
+    try registry.recordHeartbeat(report, json, 2000);
+    try registry.recordHeartbeat(report, json, heartbeat_sample_ms + 1000);
+
+    var history = try registry.prepare("SELECT COUNT(*) FROM heartbeat_history;");
+    defer history.finalize();
+    try std.testing.expect(try history.row());
+    try std.testing.expectEqual(@as(i64, 2), history.columnInt64(0));
+
+    var audit = try registry.prepare("SELECT COUNT(*) FROM audit_events;");
+    defer audit.finalize();
+    try std.testing.expect(try audit.row());
+    try std.testing.expectEqual(@as(i64, 1), audit.columnInt64(0));
+}
+
+test "node listing uses stable cursor pagination" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    var report: heartbeat.Heartbeat = .{
+        .node_id = "edge-01",
+        .hostname = "edge-01",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    inline for (.{ "edge-01", "edge-02", "edge-03" }) |node_id| {
+        report.node_id = node_id;
+        report.hostname = node_id;
+        const json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+        defer std.testing.allocator.free(json);
+        try registry.recordHeartbeat(report, json, 1000);
+    }
+
+    const first = try registry.listNodes(1000, 3000, 2, null);
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"node_id\":\"edge-01\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"node_id\":\"edge-02\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"node_id\":\"edge-03\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"next_after\":\"edge-02\"") != null);
+
+    const second = try registry.listNodes(1000, 3000, 2, "edge-02");
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"node_id\":\"edge-03\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"next_after\":null") != null);
 }
 
 test "desired state rolls out in waves and automatically rolls back" {
