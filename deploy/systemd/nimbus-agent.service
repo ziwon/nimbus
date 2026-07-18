@@ -1,0 +1,23 @@
+[Unit]
+Description=Nimbus fleet agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=NIMBUS_SERVER=http://control-plane.example:8080
+Environment=NIMBUS_NODE_ID_FILE=/var/lib/nimbus/node-id
+Environment=NIMBUS_ROLE=edge
+EnvironmentFile=-/etc/nimbus/nimbus.env
+ExecStart=/usr/local/bin/nimbus agent run
+Restart=on-failure
+RestartSec=5s
+StateDirectory=nimbus
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

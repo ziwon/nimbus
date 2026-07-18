@@ -1,0 +1,8 @@
+.git
+.zig-cache
+zig-out
+*.db
+*.db-shm
+*.db-wal
+.nimbus-node-id
+archive
