@@ -5,13 +5,17 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)](#cross-compile)
 
-Nimbus is a lightweight Zig agent and control plane for discovering and
-monitoring heterogeneous edge, server, desktop, and cloud nodes. One binary
-provides:
+Nimbus is a lightweight Zig control plane and agent for operating heterogeneous
+edge AI, intermediary, server, and cloud nodes. One binary provides:
 
 - a long-running agent with stable on-disk identity;
 - interval, jitter, exponential retry, and graceful POSIX shutdown;
-- a bearer-token-protected HTTP control plane;
+- labels and roles for targeting glasses, drones, vehicles, desktops, and servers;
+- a versioned desired-state and reconciliation loop;
+- opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
+- batched rollout, health gates, status history, and automatic rollback;
+- SHA-256 artifact verification with optional Ed25519 signatures;
+- separate node and administrative bearer tokens when configured;
 - persistent node reports and heartbeat history in embedded SQLite;
 - online/stale fleet views through the CLI and HTTP API;
 - static Linux and native Windows/macOS cross-builds.
@@ -73,7 +77,13 @@ Print a report without sending it:
 just inspect
 ```
 
-Run the complete local demonstration with `just demo`.
+Run the discovery demonstration with `just demo`. On Linux, run the complete
+process-runtime deployment, reconciliation, health, and deletion flow with:
+
+```bash
+just orchestration-demo
+```
+
 `scripts/build-all.sh` and `scripts/demo.sh` are thin wrappers around the
 corresponding recipes.
 
@@ -85,8 +95,9 @@ corresponding recipes.
 |---|---|
 | Setup | `just bootstrap`, `just doctor`, `just help` |
 | Development | `just fmt`, `just build`, `just test`, `just check`, `just version` |
-| Running Nimbus | `just server`, `just agent`, `just inspect`, `just nodes`, `just node NODE_ID` |
-| Integration | `just demo`, `just run ARGS` |
+| Running Nimbus | `just server`, `just agent`, `just orchestrator`, `just inspect`, `just nodes`, `just node NODE_ID` |
+| Desired state | `just deploy FILE`, `just deployments`, `just deployment NAME`, `just rollback NAME`, `just undeploy NAME` |
+| Integration | `just demo`, `just orchestration-demo`, `just run ARGS` |
 | Release | `just release`, `just verify-static`, `just artifacts`, `just checksums` |
 | Docker | `just docker-build`, `just docker-run`, `just docker-check` |
 | Source control | `just git-status`, `just git-diff`, `just git-log`, `just pre-commit` |
@@ -95,8 +106,9 @@ corresponding recipes.
 Recipe parameters can override defaults. For example:
 
 ```bash
-just server 0.0.0.0 9090 /var/lib/nimbus/nimbus.db local-token
-just agent http://127.0.0.1:9090 server local-token
+just server 0.0.0.0 9090 /var/lib/nimbus/nimbus.db node-token operator-token
+just agent http://127.0.0.1:9090 server node-token
+just deploy examples/deployments/process-demo.json http://127.0.0.1:9090 operator-token
 just demo 19090 demo-token
 IMAGE=registry.example/nimbus:dev just docker-build
 ```
@@ -111,13 +123,21 @@ Every operational command accepts a JSON configuration file with `--config`:
 ```json
 {
   "server": "http://127.0.0.1:8080",
-  "role": "edge",
+  "role": "smart-class",
+  "labels": ["site=school-a", "device=desktop", "accelerator=jetson"],
   "node_id_file": "/var/lib/nimbus/node-id",
   "interval_seconds": 30,
   "jitter_seconds": 5,
   "retry_initial_seconds": 1,
   "retry_max_seconds": 30,
-  "token": "development-token",
+  "orchestration": true,
+  "state_dir": "/var/lib/nimbus/state",
+  "runtimes": "systemd,docker,containerd",
+  "artifact_public_key": "HEX_ENCODED_ED25519_PUBLIC_KEY",
+  "require_artifact_signatures": true,
+  "max_artifact_bytes": 8589934592,
+  "token": "node-token",
+  "admin_token": "operator-token",
   "bind": "127.0.0.1",
   "port": 8080,
   "database": "nimbus.db",
@@ -128,28 +148,81 @@ Every operational command accepts a JSON configuration file with `--config`:
 Precedence is command-line option, environment variable, configuration file,
 then built-in default. Supported environment variables include:
 
-- `NIMBUS_CONFIG`, `NIMBUS_SERVER`, and `NIMBUS_TOKEN`;
-- `NIMBUS_NODE_ID`, `NIMBUS_NODE_ID_FILE`, and `NIMBUS_ROLE`;
+- `NIMBUS_CONFIG`, `NIMBUS_SERVER`, `NIMBUS_TOKEN`, and `NIMBUS_ADMIN_TOKEN`;
+- `NIMBUS_NODE_ID`, `NIMBUS_NODE_ID_FILE`, `NIMBUS_ROLE`, and `NIMBUS_LABELS`;
 - `NIMBUS_INTERVAL_SECONDS`, `NIMBUS_JITTER_SECONDS`,
   `NIMBUS_RETRY_INITIAL_SECONDS`, and `NIMBUS_RETRY_MAX_SECONDS`;
 - `NIMBUS_BIND`, `NIMBUS_PORT`, `NIMBUS_DATABASE`, and
-  `NIMBUS_STALE_AFTER_SECONDS`.
+  `NIMBUS_STALE_AFTER_SECONDS`;
+- `NIMBUS_ORCHESTRATION`, `NIMBUS_RUNTIMES`, `NIMBUS_STATE_DIR`,
+  `NIMBUS_ARTIFACT_PUBLIC_KEY`, `NIMBUS_REQUIRE_ARTIFACT_SIGNATURES`, and
+  `NIMBUS_MAX_ARTIFACT_BYTES`.
+
+Use separate configuration files for the server/operator and agent in real
+deployments so the administrative token is never copied to managed nodes.
 
 ## HTTP API
 
-`GET /healthz` is public. When a token is configured, all other endpoints
-require `Authorization: Bearer TOKEN`.
+`GET /healthz` is public. Other endpoints require `Authorization: Bearer TOKEN`
+when authentication is configured. `--token` protects agent routes;
+`--admin-token` protects operator routes and falls back to `--token` when it is
+not configured.
 
 ```text
 POST /v1/heartbeat
 GET  /v1/nodes
 GET  /v1/nodes/{node_id}
+GET  /v1/nodes/{node_id}/desired-state
+POST /v1/nodes/{node_id}/workload-status
+GET  /v1/deployments
+PUT  /v1/deployments/{name}
+GET  /v1/deployments/{name}
+DELETE /v1/deployments/{name}
+POST /v1/deployments/{name}/rollback
 ```
 
 Heartbeats are schema-versioned and validated before they are written. SQLite
 stores the current node record, full heartbeat history, and basic audit events.
 The list and inspect endpoints calculate `online` or `stale` from the server's
-receipt time and `--stale-after` threshold.
+receipt time and `--stale-after` threshold. Desired state, assignments, rollout
+progress, and workload status history are persisted in the same database.
+
+## Workload orchestration
+
+Apply and inspect a deployment:
+
+```bash
+nimbus deployments apply examples/deployments/process-demo.json \
+  --server http://127.0.0.1:8080 --token "$NIMBUS_ADMIN_TOKEN"
+nimbus deployments list --server http://127.0.0.1:8080
+nimbus deployments inspect process-demo --server http://127.0.0.1:8080
+```
+
+Enable only the runtimes a node is trusted to execute:
+
+```bash
+nimbus agent run --orchestrate --runtimes systemd,docker,containerd \
+  --label site=school-a --label device=edge-server \
+  --state-dir /var/lib/nimbus/state
+```
+
+Runtime adapters are deliberately allowlisted per agent:
+
+| Runtime | Desired-state reference | Notes |
+|---|---|---|
+| `process` | Absolute argv or verified `{artifact}` | Linux bootstrap workloads; no shell expansion |
+| `systemd` | Existing unit name | Uses `systemctl`; preferred for host processes |
+| `docker` | Image pinned by `@sha256:` | Creates `nimbus-NAME` with Docker restart policy |
+| `containerd` | Image pinned by `@sha256:` | Uses nerdctl in the `nimbus` namespace |
+
+Targets may use node IDs, roles, `all`, or an AND set of labels. Rollouts have a
+deterministic node order, bounded batch size, health-gated waves, an optional
+pause, and an unavailable threshold. A failed wave automatically restores the
+previous revision when `auto_rollback` is enabled. Deleting a deployment causes
+agents to stop it on their next reconciliation.
+
+See [Workload orchestration](docs/orchestration.md) for the schema, runtime
+behavior, security controls, and production limitations.
 
 ## Cross-compile
 
@@ -192,6 +265,7 @@ The long-running systemd unit is at
 ## Documentation
 
 The [documentation index](docs/README.md) links to the
-[architecture](docs/architecture.md) and
+[architecture](docs/architecture.md),
+[workload orchestration](docs/orchestration.md), and
 [development](docs/development.md) guides. The root README focuses on setup and
 operation; the documents describe internal design and contributor workflows.

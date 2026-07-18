@@ -10,6 +10,7 @@ installation, commands, configuration, and day-to-day operation.
 |---|---|---|
 | [Project README](../README.md) | Quick start, CLI usage, configuration, Just recipes, and deployment | Users and operators |
 | [Architecture](architecture.md) | System boundaries, component responsibilities, data flow, persistence, and design trade-offs | Maintainers and reviewers |
+| [Workload orchestration](orchestration.md) | Deployment schema, targeting, runtimes, reconciliation, rollout, artifacts, and security | Operators and platform engineers |
 | [Development](development.md) | Project-specific Zig concepts, repository workflow, testing, debugging, and change checklists | Contributors |
 | [SQLite vendoring notes](../third_party/sqlite/README.md) | Origin and licensing of the embedded SQLite amalgamation | Maintainers and release engineers |
 
@@ -19,7 +20,8 @@ installation, commands, configuration, and day-to-day operation.
 
 Start with the [project README](../README.md). It documents the supported
 commands and the `justfile` interface without requiring knowledge of the
-internals.
+internals. Continue with [Workload orchestration](orchestration.md) before
+enabling runtime adapters on managed nodes.
 
 ### Contributing code
 
@@ -34,19 +36,12 @@ state semantics, security boundary, and known limitations.
 
 ## Documentation boundaries
 
-The current documentation describes the implemented Nimbus foundation:
+The root README is the concise user entry point. Architecture documents why
+the system is shaped this way. Workload orchestration defines current operator
+semantics and production boundaries. Development documents repository-specific
+Zig practices and change workflows.
 
-- one Zig executable containing the CLI, agent, and control plane;
-- agent-initiated HTTP heartbeat delivery;
-- stable local node identity;
-- bearer-token authentication for development deployments;
-- SQLite-backed node state, heartbeat history, and audit events;
-- five cross-compiled release targets.
-
-GPU discovery, desired-state reconciliation, runtime deployment, and OTA
-updates are not implemented. They should be documented as current behavior only
-after their code and tests exist.
-
-When the protocol or security surface becomes large enough to evolve
-independently, add focused `protocol.md` and `security.md` documents and link
-them from this index.
+The docs describe implemented behavior, including desired-state reconciliation
+and runtime deployment. Future GPU/resource scheduling, secrets, high
+availability, and per-node identity should be documented as current behavior
+only after their code and tests exist.

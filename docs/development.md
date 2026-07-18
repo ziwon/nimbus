@@ -60,6 +60,7 @@ Useful focused commands include:
 
 ```bash
 just demo
+just orchestration-demo
 just run --version
 just inspect
 just docker-check
@@ -74,11 +75,14 @@ build.zig                     Zig build and cross-release graph
 build.zig.zon                 Package metadata and included paths
 justfile                      Canonical development and operations tasks
 src/main.zig                  Process entry point and CLI dispatch
-src/agent.zig                 Agent heartbeat lifecycle
+src/agent.zig                 Agent heartbeat and reconciliation lifecycle
 src/client.zig                HTTP client operations
 src/config.zig                JSON and environment configuration
 src/heartbeat.zig             Heartbeat schema and local collection
 src/identity.zig              Stable node identity
+src/orchestration.zig         Desired-state types and validation
+src/reconciler.zig            Local desired/current reconciliation
+src/runtime.zig               Runtime adapters and artifact verification
 src/server.zig                HTTP control plane
 src/shutdown.zig              Signal and shutdown coordination
 src/storage.zig               SQLite persistence
@@ -86,6 +90,7 @@ third_party/sqlite/           Vendored SQLite amalgamation
 deploy/systemd/               Agent service unit
 scripts/                      Compatibility wrappers around Just recipes
 docs/                         Design and contributor documentation
+examples/deployments/         Runnable desired-state examples
 ```
 
 ## Zig concepts used in Nimbus
@@ -176,8 +181,10 @@ network, clock, randomness, and sleep operations receive `init.io`. Preserve
 that dependency rather than mixing in older standard-library APIs from examples
 written for other Zig versions.
 
-The server uses `init.io.concurrent` for a small shutdown monitor that shuts
-down the listener when SIGINT or SIGTERM requests shutdown.
+The server uses `std.Io.Group.concurrent` for connection tasks and
+`init.io.concurrent` for the shutdown monitor. The registry protects its one
+SQLite connection and multi-statement transactions with `std.Io.Mutex`; keep
+lock acquisition outside transaction begin/commit boundaries.
 
 ### C interoperability
 
@@ -201,7 +208,7 @@ block in `main.zig`. Add small deterministic tests next to pure validation,
 serialization, retry, path, and storage logic.
 
 Use an in-memory SQLite database for storage unit tests. Use `just demo` for the
-process-level server/agent/CLI path.
+discovery path and `just orchestration-demo` for the Linux process-runtime path.
 
 ## Configuration development
 
@@ -261,14 +268,35 @@ For a backward-compatible additive field:
 For a breaking change, increment `schema_version` and define an explicit server
 compatibility policy before merging it. Do not silently reinterpret version 1.
 
+## Changing desired-state or runtime behavior
+
+Desired state crosses the operator, control plane, database, agent, local-state,
+and host-runtime boundaries. When changing it:
+
+1. Update `orchestration.zig` and keep validation at both CLI and server trust
+   boundaries.
+2. Decide how old canonical specifications and `applied.json` records parse.
+3. Preserve revision monotonicity and later-wave use of the previous revision.
+4. Keep runtime enablement an agent policy; desired state must not expand it.
+5. Never introduce shell evaluation for workload or health-check commands.
+6. Keep artifact limits active during transfer, before disk usage grows.
+7. Add storage-state-machine and pure runtime tests.
+8. Run `just orchestration-demo`, then all cross-builds.
+
+Linux process control must verify both PID and `/proc` start-time ticks before
+sending a signal. Container images must remain digest-pinned. If a new adapter
+needs credentials, mounts, devices, or privileges, define those security and
+redaction boundaries before adding fields.
+
 ## Changing SQLite storage
 
-The current startup migration uses idempotent `CREATE TABLE IF NOT EXISTS`
-statements. That is sufficient only while the initial schema remains stable.
+The current startup schema records migration versions and uses idempotent
+`CREATE TABLE IF NOT EXISTS` statements. This bootstraps new databases, but it
+is not yet a complete ordered upgrade runner for destructive column changes.
 
 Before changing existing columns or constraints:
 
-1. Define a schema-version table and ordered migrations.
+1. Add an ordered migration step and a new `schema_migrations` version.
 2. Test upgrading a database created by the previous release.
 3. Keep current-node upsert, history append, and audit append atomic.
 4. Continue binding external values through prepared statements.
@@ -307,6 +335,10 @@ backoff, endpoint construction, strict configuration, and in-memory storage.
 
 `just demo` builds Nimbus, starts a temporary server, waits for `/healthz`,
 sends a one-shot heartbeat, lists nodes, and terminates the server gracefully.
+
+`just orchestration-demo` additionally registers a target node, applies a
+deployment, reconciles a Linux process, verifies healthy assignment state,
+deletes desired state, and verifies that the next pass stops the process.
 
 `just docker-check` performs the equivalent health and shutdown check against
 the scratch container image.
@@ -377,6 +409,14 @@ identity, SQLite databases, or Docker data.
   clean and Docker builds noticeably slower.
 - **Fixed client buffers:** review response-size limits before adding large list
   or inspection payloads.
+- **Stale status reports:** rollout failure counts must match the current
+  revision; an old report must not roll back a new deployment.
+- **SQLite statement text:** copy column text before stepping the same statement,
+  and keep the registry mutex held across transactions.
+- **PID reuse:** never signal a process record without matching its stored Linux
+  start-time ticks.
+- **Artifact size:** post-download checks are not sufficient; enforce limits
+  while copying or receiving bytes.
 
 ## Contribution checklist
 
@@ -388,6 +428,8 @@ Before handing off a change:
 - Run `just pre-commit` for build, protocol, storage, platform, or dependency
   changes.
 - Run `just demo` for agent/server/CLI behavior changes.
+- Run `just orchestration-demo` for desired-state, status, runtime, or rollout
+  changes.
 - Run `just docker-check` for container or shutdown changes.
 - Update README usage only when users need it.
 - Update architecture or development documentation when a boundary, invariant,
