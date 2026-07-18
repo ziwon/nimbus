@@ -11,6 +11,7 @@ installation, commands, configuration, and day-to-day operation.
 | [Project README](../README.md) | Quick start, CLI usage, configuration, Just recipes, and deployment | Users and operators |
 | [Architecture](architecture.md) | System boundaries, component responsibilities, data flow, persistence, and design trade-offs | Maintainers and reviewers |
 | [Workload orchestration](orchestration.md) | Deployment schema, targeting, runtimes, reconciliation, rollout, artifacts, and security | Operators and platform engineers |
+| [AI accelerator planning](planning.md) | Accelerator inventory, requirements, runtime injection, model lifecycle, and edge-aware placement roadmap | Maintainers and platform engineers |
 | [Development](development.md) | Project-specific Zig concepts, repository workflow, testing, debugging, and change checklists | Contributors |
 | [SQLite vendoring notes](../third_party/sqlite/README.md) | Origin and licensing of the embedded SQLite amalgamation | Maintainers and release engineers |
 
