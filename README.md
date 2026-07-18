@@ -1,5 +1,10 @@
 # Nimbus
 
+[![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/)
+[![CI](https://github.com/ziwon/nimbus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ziwon/nimbus/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)](#cross-compile)
+
 Nimbus is a lightweight Zig agent and control plane for discovering and
 monitoring heterogeneous edge, server, desktop, and cloud nodes.
 
