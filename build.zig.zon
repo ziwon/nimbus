@@ -1,6 +1,6 @@
 .{
     .name = .nimbus,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0xe454710057b62e0,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
@@ -14,6 +14,7 @@
         "LICENSE",
         "scripts",
         "deploy",
+        "examples",
         "third_party",
     },
 }

@@ -7,10 +7,16 @@ pub const Heartbeat = struct {
     node_id: []const u8,
     hostname: []const u8,
     role: []const u8,
+    labels: []const Label = &.{},
     platform: Platform,
     resources: Resources,
     timestamp_unix_ms: i64,
     agent_version: []const u8 = build_options.version,
+};
+
+pub const Label = struct {
+    key: []const u8,
+    value: []const u8,
 };
 
 pub const Platform = struct {
@@ -23,7 +29,12 @@ pub const Resources = struct {
     cpu_count: usize,
 };
 
-pub fn collect(init: std.process.Init, node_id: []const u8, role: []const u8) Heartbeat {
+pub fn collect(
+    init: std.process.Init,
+    node_id: []const u8,
+    role: []const u8,
+    labels: []const Label,
+) Heartbeat {
     const hostname = init.environ_map.get("HOSTNAME") orelse
         init.environ_map.get("COMPUTERNAME") orelse
         "unknown";
@@ -32,6 +43,7 @@ pub fn collect(init: std.process.Init, node_id: []const u8, role: []const u8) He
         .node_id = node_id,
         .hostname = hostname,
         .role = role,
+        .labels = labels,
         .platform = .{
             .os = @tagName(builtin.target.os.tag),
             .arch = @tagName(builtin.target.cpu.arch),

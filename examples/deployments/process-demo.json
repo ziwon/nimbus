@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "process-demo",
+  "revision": 1,
+  "desired": "running",
+  "runtime": {
+    "kind": "process",
+    "command": ["/usr/bin/tail", "-f", "/dev/null"]
+  },
+  "health_check": {
+    "kind": "runtime",
+    "timeout_seconds": 5,
+    "failure_threshold": 3
+  },
+  "restart_policy": "always",
+  "targets": {
+    "node_ids": ["demo-edge"]
+  },
+  "rollout": {
+    "batch_size": 1,
+    "max_unavailable": 1,
+    "pause_seconds": 0,
+    "auto_rollback": true
+  }
+}

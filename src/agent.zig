@@ -1,16 +1,21 @@
 const std = @import("std");
 const heartbeat = @import("heartbeat.zig");
 const client = @import("client.zig");
+const reconciler = @import("reconciler.zig");
+const runtime = @import("runtime.zig");
 const shutdown = @import("shutdown.zig");
 
 pub const Options = struct {
     server: []const u8,
     node_id: []const u8,
     role: []const u8,
+    labels: []const heartbeat.Label,
     interval_seconds: u64,
     jitter_seconds: u64,
     retry_initial_seconds: u64,
     retry_max_seconds: u64,
+    orchestration_enabled: bool,
+    runtime_options: runtime.Options,
     token: ?[]const u8,
     once: bool = false,
 };
@@ -33,6 +38,14 @@ pub fn run(init: std.process.Init, options: Options) !void {
 
         if (sent) {
             backoff = options.retry_initial_seconds;
+            if (options.orchestration_enabled) {
+                reconciler.reconcileOnce(init, .{
+                    .server = options.server,
+                    .node_id = options.node_id,
+                    .token = options.token,
+                    .runtime_options = options.runtime_options,
+                }) catch |err| try log(init, "reconciliation failed: {t}\n", .{err});
+            }
             if (options.once) return;
             const delay = options.interval_seconds + randomJitter(init.io, options.jitter_seconds);
             try shutdown.sleepInterruptible(init.io, delay * 1000);
@@ -46,7 +59,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
 }
 
 fn sendOnce(init: std.process.Init, endpoint: []const u8, options: Options) !bool {
-    const value = heartbeat.collect(init, options.node_id, options.role);
+    const value = heartbeat.collect(init, options.node_id, options.role, options.labels);
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);
 
