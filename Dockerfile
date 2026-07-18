@@ -12,11 +12,12 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac && \
     python -m ziglang build -Dtarget="$target" -Doptimize=ReleaseSmall
-RUN mkdir /nimbus-data
+RUN mkdir /nimbus-data && chown 65532:65532 /nimbus-data
 
 FROM scratch
 COPY --from=build /src/zig-out/bin/nimbus /nimbus
-COPY --from=build /nimbus-data /data
+COPY --from=build --chown=65532:65532 /nimbus-data /data
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/nimbus"]
 CMD ["server", "--bind", "0.0.0.0", "--port", "8080", "--database", "/data/nimbus.db"]
