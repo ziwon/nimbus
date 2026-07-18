@@ -102,10 +102,7 @@ fn handleConnection(
         return ingestHeartbeat(init, registry, &request);
     }
 
-    if (request.head.method == .GET and
-        (std.mem.eql(u8, request.head.target, "/v1/nodes") or
-            std.mem.eql(u8, request.head.target, "/v1/agents")))
-    {
+    if (request.head.method == .GET and std.mem.eql(u8, request.head.target, "/v1/nodes")) {
         const now = Io.Clock.real.now(init.io).toMilliseconds();
         const response = try registry.listNodes(now, staleMillis(options.stale_after_seconds));
         defer init.gpa.free(response);

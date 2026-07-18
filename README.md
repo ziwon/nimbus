@@ -6,10 +6,8 @@
 [![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)](#cross-compile)
 
 Nimbus is a lightweight Zig agent and control plane for discovering and
-monitoring heterogeneous edge, server, desktop, and cloud nodes.
-
-The former `fleetprobe` bootstrap has been promoted to the `nimbus` executable.
-One binary now provides:
+monitoring heterogeneous edge, server, desktop, and cloud nodes. One binary
+provides:
 
 - a long-running agent with stable on-disk identity;
 - interval, jitter, exponential retry, and graceful POSIX shutdown;
@@ -75,9 +73,9 @@ Print a report without sending it:
 just inspect
 ```
 
-Run the complete local demonstration with `just demo`. The old
-`scripts/build-all.sh` and `scripts/demo.sh` entry points remain as thin
-compatibility wrappers around the corresponding recipes.
+Run the complete local demonstration with `just demo`.
+`scripts/build-all.sh` and `scripts/demo.sh` are thin wrappers around the
+corresponding recipes.
 
 ## Project tasks
 
@@ -146,7 +144,6 @@ require `Authorization: Bearer TOKEN`.
 POST /v1/heartbeat
 GET  /v1/nodes
 GET  /v1/nodes/{node_id}
-GET  /v1/agents             compatibility endpoint
 ```
 
 Heartbeats are schema-versioned and validated before they are written. SQLite
@@ -198,15 +195,3 @@ The [documentation index](docs/README.md) links to the
 [architecture](docs/architecture.md) and
 [development](docs/development.md) guides. The root README focuses on setup and
 operation; the documents describe internal design and contributor workflows.
-
-## Migration compatibility
-
-The legacy command names remain as aliases during migration:
-
-```text
-nimbus inspect  -> nimbus agent inspect
-nimbus send     -> nimbus agent run --once
-nimbus serve    -> nimbus server
-```
-
-New automation should use the hierarchical Nimbus commands.

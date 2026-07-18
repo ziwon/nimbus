@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
         if (args.len < 3) usageAndExit(init, "agent requires run or inspect");
         const file_config = try loadConfig(init, args[3..]);
         if (std.mem.eql(u8, args[2], "run")) {
-            try runAgent(init, file_config, args[3..], false);
+            try runAgent(init, file_config, args[3..]);
         } else if (std.mem.eql(u8, args[2], "inspect")) {
             try inspectAgent(init, file_config, args[3..]);
         } else {
@@ -46,15 +46,6 @@ pub fn main(init: std.process.Init) !void {
         if (args.len < 3) usageAndExit(init, "nodes requires list or inspect");
         const file_config = try loadConfig(init, args[3..]);
         try runNodes(init, file_config, args[2], args[3..]);
-    } else if (std.mem.eql(u8, command, "inspect")) {
-        const file_config = try loadConfig(init, args[2..]);
-        try inspectAgent(init, file_config, args[2..]);
-    } else if (std.mem.eql(u8, command, "send")) {
-        const file_config = try loadConfig(init, args[2..]);
-        try runAgent(init, file_config, args[2..], true);
-    } else if (std.mem.eql(u8, command, "serve")) {
-        const file_config = try loadConfig(init, args[2..]);
-        try runServer(init, file_config, args[2..]);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
         try Io.File.stdout().writeStreamingAll(init.io, build_options.version ++ "\n");
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -168,10 +159,8 @@ fn runAgent(
     init: std.process.Init,
     file_config: config.FileConfig,
     args: []const []const u8,
-    legacy_once: bool,
 ) !void {
-    var options = try parseAgentOptions(init, file_config, args);
-    if (legacy_once) options.once = true;
+    const options = try parseAgentOptions(init, file_config, args);
     const node_id = options.node_id orelse try identity.loadOrCreate(init, options.node_id_file);
     try agent.run(init, .{
         .server = options.server_url,
@@ -327,8 +316,6 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\NIMBUS_SERVER, NIMBUS_TOKEN, NIMBUS_NODE_ID, NIMBUS_NODE_ID_FILE,
         \\NIMBUS_ROLE, NIMBUS_INTERVAL_SECONDS, NIMBUS_JITTER_SECONDS,
         \\NIMBUS_DATABASE, NIMBUS_BIND, NIMBUS_PORT, and NIMBUS_STALE_AFTER_SECONDS.
-        \\
-        \\Compatibility aliases: inspect, send, serve.
         \\
     ) catch {};
     std.process.exit(if (message == null) 0 else 2);

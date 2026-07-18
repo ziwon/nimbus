@@ -5,4 +5,3 @@ zig-out
 *.db-shm
 *.db-wal
 .nimbus-node-id
-archive

@@ -84,7 +84,6 @@ nimbus nodes list
 nimbus nodes inspect NODE_ID
 ```
 
-The legacy `inspect`, `send`, and `serve` aliases remain compatibility shims.
 Keeping the roles together reduces packaging complexity during the foundation
 phase. The modules already separate agent, server, client, and storage logic so
 future binaries can be split without redesigning the protocol.
@@ -221,7 +220,6 @@ The server exposes a small HTTP surface:
 | `POST` | `/v1/heartbeat` | Bearer token when configured | Validate and persist one heartbeat |
 | `GET` | `/v1/nodes` | Bearer token when configured | Return current fleet summaries |
 | `GET` | `/v1/nodes/{node_id}` | Bearer token when configured | Return current report and liveness status |
-| `GET` | `/v1/agents` | Bearer token when configured | Compatibility alias for `/v1/nodes` |
 
 ```mermaid
 flowchart LR

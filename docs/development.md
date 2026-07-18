@@ -239,8 +239,8 @@ parser. When adding a command:
 5. Update the project README and architecture module map as needed.
 6. Test both the direct command and the relevant end-to-end flow.
 
-Avoid new legacy aliases. The existing aliases exist only for the fleetprobe
-migration.
+Keep the command hierarchy explicit. Add a shortcut only when it has a durable
+operator use case and can be supported as part of the public CLI.
 
 ## Changing the heartbeat schema
 
