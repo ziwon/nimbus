@@ -94,8 +94,63 @@ checksums: release
     done >> "$checksum_file"
     cat "$checksum_file"
 
+# Run native API integration checks.
+api-check port="18083" token="api-check-token": build
+    #!/usr/bin/env sh
+    set -eu
+    port={{ quote(port) }}
+    token={{ quote(token) }}
+    run_dir=$(mktemp -d "${TMPDIR:-/tmp}/nimbus-api-check-XXXXXX")
+    database="$run_dir/nimbus.db"
+    oversized="$run_dir/oversized.json"
+    server_pid=""
+    cleanup() {
+      if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+      fi
+      find "$run_dir" -depth -delete 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+    export NIMBUS_TOKEN="$token"
+    export NIMBUS_ADMIN_TOKEN="$token"
+
+    ./zig-out/bin/nimbus server --bind 127.0.0.1 --port "$port" --database "$database" &
+    server_pid=$!
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS "http://127.0.0.1:$port/readyz" >/dev/null 2>&1; then ready=true; break; fi
+      sleep 0.2
+    done
+    test "$ready" = true
+
+    test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/nodes")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:$port/v1/nodes")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data '{"schema_version":9}' "http://127.0.0.1:$port/v1/heartbeat")" = 400
+    head -c 70000 /dev/zero | tr '\000' x > "$oversized"
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data-binary "@$oversized" "http://127.0.0.1:$port/v1/heartbeat")" = 413
+
+    ./zig-out/bin/nimbus agent run --once --id api-edge --server "http://127.0.0.1:$port"
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
+    kill "$server_pid"
+    wait "$server_pid"
+    server_pid=""
+
+    ./zig-out/bin/nimbus server --bind 127.0.0.1 --port "$port" --database "$database" &
+    server_pid=$!
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS "http://127.0.0.1:$port/readyz" >/dev/null 2>&1; then ready=true; break; fi
+      sleep 0.2
+    done
+    test "$ready" = true
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
+
+# Run native end-to-end checks.
+integration: demo api-check orchestration-demo
+
 # Run the complete local/CI verification pipeline.
-ci: check release verify-static checksums
+ci: check integration release verify-static checksums
 
 # Compatibility aggregate used by scripts/build-all.sh.
 build-all: ci artifacts
@@ -106,15 +161,15 @@ run *args: build
 
 # Start the control plane in the foreground.
 server bind=control_bind port=control_port database=control_database token=control_token admin_token=control_admin_token: build
-    ./zig-out/bin/nimbus server --bind {{ quote(bind) }} --port {{ quote(port) }} --database {{ quote(database) }} --token {{ quote(token) }} --admin-token {{ quote(admin_token) }}
+    NIMBUS_TOKEN={{ quote(token) }} NIMBUS_ADMIN_TOKEN={{ quote(admin_token) }} ./zig-out/bin/nimbus server --bind {{ quote(bind) }} --port {{ quote(port) }} --database {{ quote(database) }}
 
 # Start a long-running local agent.
 agent server=control_server role=agent_role token=control_token: build
-    ./zig-out/bin/nimbus agent run --server {{ quote(server) }} --role {{ quote(role) }} --token {{ quote(token) }}
+    NIMBUS_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus agent run --server {{ quote(server) }} --role {{ quote(role) }}
 
 # Start an orchestration-enabled agent with an explicit runtime allowlist.
 orchestrator server=control_server role=agent_role token=control_token runtimes="process" state_dir=".nimbus-state": build
-    ./zig-out/bin/nimbus agent run --orchestrate --server {{ quote(server) }} --role {{ quote(role) }} --token {{ quote(token) }} --runtimes {{ quote(runtimes) }} --state-dir {{ quote(state_dir) }}
+    NIMBUS_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus agent run --orchestrate --server {{ quote(server) }} --role {{ quote(role) }} --runtimes {{ quote(runtimes) }} --state-dir {{ quote(state_dir) }}
 
 # Print the local node report without sending it.
 inspect role=agent_role: build
@@ -122,31 +177,31 @@ inspect role=agent_role: build
 
 # List registered nodes.
 nodes server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus nodes list --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus nodes list --server {{ quote(server) }}
 
 # Inspect one registered node.
 node node_id server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus nodes inspect {{ quote(node_id) }} --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus nodes inspect {{ quote(node_id) }} --server {{ quote(server) }}
 
 # Apply a desired-state deployment document.
 deploy file server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus deployments apply {{ quote(file) }} --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus deployments apply {{ quote(file) }} --server {{ quote(server) }}
 
 # List desired-state deployments.
 deployments server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus deployments list --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus deployments list --server {{ quote(server) }}
 
 # Inspect rollout and assignment state for one deployment.
 deployment name server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus deployments inspect {{ quote(name) }} --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus deployments inspect {{ quote(name) }} --server {{ quote(server) }}
 
 # Roll a deployment back to its retained previous revision.
 rollback name server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus deployments rollback {{ quote(name) }} --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus deployments rollback {{ quote(name) }} --server {{ quote(server) }}
 
 # Delete desired state; agents stop the workload on their next reconciliation.
 undeploy name server=control_server token=control_admin_token: build
-    ./zig-out/bin/nimbus deployments delete {{ quote(name) }} --server {{ quote(server) }} --token {{ quote(token) }}
+    NIMBUS_ADMIN_TOKEN={{ quote(token) }} ./zig-out/bin/nimbus deployments delete {{ quote(name) }} --server {{ quote(server) }}
 
 # Run a disposable end-to-end server/agent/CLI demonstration.
 demo port=demo_port token=demo_token database=demo_database: build
@@ -154,6 +209,8 @@ demo port=demo_port token=demo_token database=demo_database: build
     set -eu
     port={{ quote(port) }}
     token={{ quote(token) }}
+    export NIMBUS_TOKEN="$token"
+    export NIMBUS_ADMIN_TOKEN="$token"
     database={{ quote(database) }}
     if [ -z "$database" ]; then
       database="${TMPDIR:-/tmp}/nimbus-demo-$$.db"
@@ -162,8 +219,7 @@ demo port=demo_port token=demo_token database=demo_database: build
     ./zig-out/bin/nimbus server \
       --bind 127.0.0.1 \
       --port "$port" \
-      --database "$database" \
-      --token "$token" &
+      --database "$database" &
     server_pid=$!
     trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT INT TERM
 
@@ -184,11 +240,9 @@ demo port=demo_port token=demo_token database=demo_database: build
       --once \
       --server "http://127.0.0.1:$port" \
       --id demo-edge \
-      --role edge \
-      --token "$token"
+      --role edge
     ./zig-out/bin/nimbus nodes list \
-      --server "http://127.0.0.1:$port" \
-      --token "$token"
+      --server "http://127.0.0.1:$port"
 
 # Run the Linux process-runtime orchestration flow end to end.
 orchestration-demo port="18082" token="orchestration-token": build
@@ -196,6 +250,8 @@ orchestration-demo port="18082" token="orchestration-token": build
     set -eu
     port={{ quote(port) }}
     token={{ quote(token) }}
+    export NIMBUS_TOKEN="$token"
+    export NIMBUS_ADMIN_TOKEN="$token"
     run_dir=$(mktemp -d "${TMPDIR:-/tmp}/nimbus-orchestration-XXXXXX")
     database="$run_dir/nimbus.db"
     state_dir="$run_dir/state"
@@ -214,7 +270,7 @@ orchestration-demo port="18082" token="orchestration-token": build
     trap cleanup EXIT INT TERM
 
     ./zig-out/bin/nimbus server \
-      --bind 127.0.0.1 --port "$port" --database "$database" --token "$token" &
+      --bind 127.0.0.1 --port "$port" --database "$database" &
     server_pid=$!
     ready=false
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -228,23 +284,23 @@ orchestration-demo port="18082" token="orchestration-token": build
 
     server="http://127.0.0.1:$port"
     ./zig-out/bin/nimbus agent run --once --server "$server" \
-      --id demo-edge --role smart-class --token "$token"
+      --id demo-edge --role smart-class
     ./zig-out/bin/nimbus deployments apply examples/deployments/process-demo.json \
-      --server "$server" --token "$token"
+      --server "$server"
     ./zig-out/bin/nimbus agent run --once --orchestrate --runtimes process \
       --state-dir "$state_dir" --server "$server" \
-      --id demo-edge --role smart-class --token "$token"
+      --id demo-edge --role smart-class
     ./zig-out/bin/nimbus deployments inspect process-demo \
-      --server "$server" --token "$token"
+      --server "$server"
 
     managed_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$state_dir/applied.json")
     test -n "$managed_pid"
     kill -0 "$managed_pid"
     ./zig-out/bin/nimbus deployments delete process-demo \
-      --server "$server" --token "$token"
+      --server "$server"
     ./zig-out/bin/nimbus agent run --once --orchestrate --runtimes process \
       --state-dir "$state_dir" --server "$server" \
-      --id demo-edge --role smart-class --token "$token"
+      --id demo-edge --role smart-class
     if kill -0 "$managed_pid" 2>/dev/null; then exit 1; fi
     managed_pid=""
     grep -q '"applied":\[\]' "$state_dir/applied.json"
@@ -255,12 +311,15 @@ docker-build image=docker_image:
 
 # Run the control plane container with persistent local data.
 docker-run image=docker_image port="8080" token=control_token: (docker-build image)
+    #!/usr/bin/env sh
+    set -eu
     mkdir -p data
-    docker run --rm \
+    NIMBUS_TOKEN={{ quote(token) }} docker run --rm \
+      -e NIMBUS_TOKEN \
       -p {{ quote(port) }}:8080 \
       -v "$PWD/data:/data" \
       {{ quote(image) }} \
-      server --bind 0.0.0.0 --port 8080 --database /data/nimbus.db --token {{ quote(token) }}
+      server --bind 0.0.0.0 --port 8080 --database /data/nimbus.db
 
 # Build and health-check the Docker image, then stop it gracefully.
 docker-check image=docker_image port="18081": (docker-build image)
@@ -268,8 +327,14 @@ docker-check image=docker_image port="18081": (docker-build image)
     set -eu
     image={{ quote(image) }}
     port={{ quote(port) }}
+    token=docker-check-token
     container="nimbus-just-check-$$"
-    docker run -d --rm --name "$container" -p "$port:8080" "$image" >/dev/null
+    if docker run --rm "$image" >/dev/null 2>&1; then
+      printf '%s\n' 'unauthenticated non-loopback server unexpectedly started' >&2
+      exit 1
+    fi
+    NIMBUS_TOKEN="$token" docker run -d --rm --name "$container" \
+      -e NIMBUS_TOKEN -p "$port:8080" "$image" >/dev/null
     trap 'docker stop -t 2 "$container" >/dev/null 2>&1 || true' EXIT INT TERM
     ready=false
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -281,6 +346,9 @@ docker-check image=docker_image port="18081": (docker-build image)
     done
     test "$ready" = true
     curl -fsS "http://127.0.0.1:$port/healthz"
+    test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/nodes")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:$port/v1/nodes")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes")" = 200
     printf '\n'
     docker stop -t 2 "$container" >/dev/null
     trap - EXIT INT TERM
