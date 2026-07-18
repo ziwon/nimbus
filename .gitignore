@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+.DS_Store
+nimbus.db
+nimbus.db-shm
+nimbus.db-wal
+.nimbus-node-id
+data/
