@@ -298,7 +298,7 @@ Before changing existing columns or constraints:
 
 1. Add an ordered migration step and a new `schema_migrations` version.
 2. Test upgrading a database created by the previous release.
-3. Keep current-node upsert, history append, and audit append atomic.
+3. Keep current-node upsert, sampled history, retention, and enrollment audit atomic.
 4. Continue binding external values through prepared statements.
 5. Decide whether old raw heartbeat JSON remains readable.
 6. Verify WAL behavior and graceful server shutdown.
@@ -335,6 +335,10 @@ backoff, endpoint construction, strict configuration, and in-memory storage.
 
 `just demo` builds Nimbus, starts a temporary server, waits for `/healthz`,
 sends a one-shot heartbeat, lists nodes, and terminates the server gracefully.
+
+`just api-check` verifies readiness, authentication rejection, invalid and
+oversized heartbeats, accepted heartbeat inspection, and persistence across a
+server restart. `just integration` combines this with both end-to-end demos.
 
 `just orchestration-demo` additionally registers a target node, applies a
 deployment, reconciles a Linux process, verifies healthy assignment state,
@@ -403,8 +407,8 @@ identity, SQLite databases, or Docker data.
   time, not the agent clock.
 - **One-shot semantics:** `--once` is expected to fail on rejection rather than
   retry forever.
-- **Plain HTTP:** local success does not make a remote deployment secure; use a
-  TLS reverse proxy.
+- **HTTP server listener:** clients support HTTPS, but local success does not
+  make the embedded HTTP listener secure; use a TLS reverse proxy.
 - **Vendored C rebuilds:** changes that invalidate the SQLite object cache make
   clean and Docker builds noticeably slower.
 - **Fixed client buffers:** review response-size limits before adding large list

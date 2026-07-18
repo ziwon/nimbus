@@ -20,8 +20,10 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - online/stale fleet views through the CLI and HTTP API;
 - static Linux and native Windows/macOS cross-builds.
 
-The transport is plain HTTP in this early version. Terminate TLS at a reverse
-proxy for non-local deployments.
+Agents and the CLI can connect to HTTPS endpoints. The embedded server listener
+is HTTP-only, so terminate TLS at a reverse proxy for non-local deployments.
+An unauthenticated server may bind only to loopback unless the explicitly unsafe
+`--allow-insecure-no-auth` option is supplied.
 
 ## Requirements
 
@@ -97,7 +99,7 @@ corresponding recipes.
 | Development | `just fmt`, `just build`, `just test`, `just check`, `just version` |
 | Running Nimbus | `just server`, `just agent`, `just orchestrator`, `just inspect`, `just nodes`, `just node NODE_ID` |
 | Desired state | `just deploy FILE`, `just deployments`, `just deployment NAME`, `just rollback NAME`, `just undeploy NAME` |
-| Integration | `just demo`, `just orchestration-demo`, `just run ARGS` |
+| Integration | `just demo`, `just api-check`, `just orchestration-demo`, `just integration`, `just run ARGS` |
 | Release | `just release`, `just verify-static`, `just artifacts`, `just checksums` |
 | Docker | `just docker-build`, `just docker-run`, `just docker-check` |
 | Source control | `just git-status`, `just git-diff`, `just git-log`, `just pre-commit` |
@@ -136,24 +138,26 @@ Every operational command accepts a JSON configuration file with `--config`:
   "artifact_public_key": "HEX_ENCODED_ED25519_PUBLIC_KEY",
   "require_artifact_signatures": true,
   "max_artifact_bytes": 8589934592,
-  "token": "node-token",
-  "admin_token": "operator-token",
+  "token_file": "/run/secrets/nimbus-node-token",
+  "admin_token_file": "/run/secrets/nimbus-admin-token",
   "bind": "127.0.0.1",
   "port": 8080,
   "database": "nimbus.db",
-  "stale_after_seconds": 90
+  "stale_after_seconds": 90,
+  "allow_insecure_no_auth": false
 }
 ```
 
 Precedence is command-line option, environment variable, configuration file,
 then built-in default. Supported environment variables include:
 
-- `NIMBUS_CONFIG`, `NIMBUS_SERVER`, `NIMBUS_TOKEN`, and `NIMBUS_ADMIN_TOKEN`;
+- `NIMBUS_CONFIG`, `NIMBUS_SERVER`, `NIMBUS_TOKEN`, `NIMBUS_TOKEN_FILE`,
+  `NIMBUS_ADMIN_TOKEN`, and `NIMBUS_ADMIN_TOKEN_FILE`;
 - `NIMBUS_NODE_ID`, `NIMBUS_NODE_ID_FILE`, `NIMBUS_ROLE`, and `NIMBUS_LABELS`;
 - `NIMBUS_INTERVAL_SECONDS`, `NIMBUS_JITTER_SECONDS`,
   `NIMBUS_RETRY_INITIAL_SECONDS`, and `NIMBUS_RETRY_MAX_SECONDS`;
 - `NIMBUS_BIND`, `NIMBUS_PORT`, `NIMBUS_DATABASE`, and
-  `NIMBUS_STALE_AFTER_SECONDS`;
+  `NIMBUS_STALE_AFTER_SECONDS`, and `NIMBUS_ALLOW_INSECURE_NO_AUTH`;
 - `NIMBUS_ORCHESTRATION`, `NIMBUS_RUNTIMES`, `NIMBUS_STATE_DIR`,
   `NIMBUS_ARTIFACT_PUBLIC_KEY`, `NIMBUS_REQUIRE_ARTIFACT_SIGNATURES`, and
   `NIMBUS_MAX_ARTIFACT_BYTES`.
@@ -163,7 +167,7 @@ deployments so the administrative token is never copied to managed nodes.
 
 ## HTTP API
 
-`GET /healthz` is public. Other endpoints require `Authorization: Bearer TOKEN`
+`GET /healthz` and `GET /readyz` are public. Other endpoints require `Authorization: Bearer TOKEN`
 when authentication is configured. `--token` protects agent routes;
 `--admin-token` protects operator routes and falls back to `--token` when it is
 not configured.
@@ -181,8 +185,13 @@ DELETE /v1/deployments/{name}
 POST /v1/deployments/{name}/rollback
 ```
 
+`GET /v1/nodes` accepts `limit=1..500` and an optional `after=NODE_ID` cursor,
+and returns `{ "items": [...], "next_after": "..." | null }`.
+
 Heartbeats are schema-versioned and validated before they are written. SQLite
-stores the current node record, full heartbeat history, and basic audit events.
+always updates current node state, samples heartbeat history at most every five
+minutes per node, retains it for seven days, and retains audit events for 30
+days. Enrollment is audited once instead of auditing every accepted heartbeat.
 The list and inspect endpoints calculate `online` or `stale` from the server's
 receipt time and `--stale-after` threshold. Desired state, assignments, rollout
 progress, and workload status history are persisted in the same database.

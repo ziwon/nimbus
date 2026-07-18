@@ -68,8 +68,8 @@ flowchart LR
 
 The control plane never opens a connection to a managed node. Agents work
 behind NAT as long as they can reach the API and required artifact/image
-sources. Transport is plain HTTP inside the binary; a reverse proxy or private
-authenticated network supplies the production TLS boundary.
+sources. Agents and the CLI support HTTPS. The embedded server listener remains
+HTTP-only, so a reverse proxy supplies the production TLS boundary.
 
 ## One executable, explicit roles
 
@@ -230,10 +230,11 @@ Container images must be pinned by digest.
 | Method | Path | Credential | Purpose |
 |---|---|---|---|
 | `GET` | `/healthz` | public | Process health |
+| `GET` | `/readyz` | public | SQLite readiness |
 | `POST` | `/v1/heartbeat` | node | Register/update a node |
 | `GET` | `/v1/nodes/{id}/desired-state` | node | Pull node desired state |
 | `POST` | `/v1/nodes/{id}/workload-status` | node | Report observed state |
-| `GET` | `/v1/nodes` | admin | List fleet state |
+| `GET` | `/v1/nodes?limit=N&after=ID` | admin | Cursor-paginated fleet state |
 | `GET` | `/v1/nodes/{id}` | admin | Inspect one node |
 | `GET` | `/v1/deployments` | admin | List deployments |
 | `PUT` | `/v1/deployments/{name}` | admin | Apply increasing revision |
@@ -243,7 +244,9 @@ Container images must be pinned by digest.
 
 The administrative token falls back to the node token only when no separate
 admin token is configured. Payloads have endpoint-specific limits and all
-protocol structs are strictly validated before mutation.
+protocol structs are strictly validated before mutation. Unauthenticated
+servers fail to start on non-loopback binds unless an explicit insecure override
+is supplied.
 
 ## Persistence and concurrency
 
@@ -259,8 +262,11 @@ second busy timeout. The schema includes:
 
 Heartbeat, deployment apply, desired-state assignment, status transition, and
 rollback mutations use explicit transactions. The server accepts connections
-concurrently through `std.Io.Group`; an I/O-aware registry mutex serializes use
-of the shared SQLite connection and protects multi-statement transactions.
+concurrently through `std.Io.Group`, bounded to 64 active handlers with a
+15-second request deadline. An I/O-aware registry mutex serializes use of the
+shared SQLite connection and protects multi-statement transactions. Current node
+state is updated on every heartbeat; history is sampled every five minutes and
+retained for seven days. Audit events are retained for 30 days.
 
 This architecture handles overlapping edge requests without claiming
 horizontal control-plane scale. One server process and one database remain the
@@ -284,7 +290,7 @@ runtime allowlists, direct argv execution, immutable image references, artifact
 digests, optional signature enforcement, atomic state/artifact replacement, PID
 identity checks, and node/admin token separation.
 
-Remaining security work includes TLS in the binary, per-node credentials,
+Remaining security work includes TLS termination in the server, per-node credentials,
 credential rotation, mTLS, authorization scopes, signed desired-state
 documents, attestation, secret delivery, and sandbox/resource policy. The
 shared node token allows node impersonation by another token holder.
@@ -292,13 +298,13 @@ shared node token allows node impersonation by another token holder.
 ## Known limitations
 
 - One SQLite control plane; no replication, leader election, or failover.
-- No retention/compaction policy for heartbeat or workload history.
+- No retention/compaction policy for workload status history.
 - No rollout deadline or automatic skip for an offline current-wave node.
 - No resource-aware placement or capacity admission.
 - No ports, mounts, devices, GPU, network, secret, or resource-limit schema.
 - No offline deadline/lease that stops workloads after prolonged disconnection.
 - Process runtime is Linux-only and intentionally smaller than systemd.
-- Plain HTTP transport and HTTP-only artifact/health URLs in the binary.
+- HTTP-only embedded server, process artifact downloads, and runtime health URLs.
 - Windows/macOS artifacts compile, but orchestration adapters depend on host
   tools and the direct process adapter is Linux-only.
 - Safety-critical edge deployments still require independent hardware and

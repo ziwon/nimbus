@@ -187,9 +187,9 @@ Observed states are `pending`, `applying`, `healthy`, `degraded`, `failed`,
 | `tcp` | Connect to a numeric `host:port` before the timeout |
 | `command` | Run an absolute direct argv and require exit status zero |
 
-Command checks do not use a shell. HTTP checks currently support `http://`
-because the distributed binary disables built-in TLS; use loopback health
-endpoints and terminate external TLS at the network boundary.
+Command checks do not use a shell. Runtime HTTP checks currently support
+`http://`; use loopback health endpoints and terminate external TLS at the
+network boundary.
 
 ## Rollout and rollback
 
@@ -232,14 +232,16 @@ control plane cannot disable it in desired state.
 
 ## Authentication and transport
 
-Use `--token`/`NIMBUS_TOKEN` for agent routes and
-`--admin-token`/`NIMBUS_ADMIN_TOKEN` for operator routes. If no administrative
+Use `--token`/`NIMBUS_TOKEN` or `--token-file`/`NIMBUS_TOKEN_FILE` for agent
+routes and the corresponding administrative options for operator routes. If no administrative
 token is configured, Nimbus falls back to the node token for compatibility.
 Production deployments should always separate them and keep the administrative
 credential off managed nodes.
 
-The current binary serves plain HTTP. Place it behind a TLS reverse proxy or a
-private authenticated network. The shared node token does not provide
+Agents and the CLI can use HTTPS, while the embedded server listens on HTTP.
+Place it behind a TLS reverse proxy or a private authenticated network. A
+non-loopback server without authentication fails closed unless the explicit
+insecure override is used. The shared node token does not provide
 per-device identity: any holder can submit status for another node ID. Per-node
 credentials, rotation, mTLS, scoped authorization, and signed desired-state
 documents remain future security work.
@@ -256,8 +258,9 @@ nimbus deployments rollback NAME
 
 `inspect` returns rollout configuration, the canonical specification, and each
 node assignment with wave, observed revision, state, message, and update time.
-The complete status history is retained in SQLite for future querying but does
-not yet have a dedicated CLI endpoint or retention policy.
+The complete workload status history is retained in SQLite for future querying
+but does not yet have a dedicated CLI endpoint or retention policy. Heartbeat
+history is separately sampled and retained for seven days.
 
 ## Production boundaries
 
