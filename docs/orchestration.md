@@ -160,13 +160,13 @@ machine-readable placement reasons such as `agent_feature_unsupported`,
 `no_accelerator`, `accelerator_memory_insufficient`,
 `accelerator_capability_missing`, and `accelerator_capacity_exhausted`.
 
-This A2 reservation is logical ownership, not device access. Until A3 adds CDI
-and host-device injection, the agent preserves any existing applied workload
-and reports `accelerator_assignment_unavailable` when placement is blocked. If
-an assignment is ready, it validates and saves the assignment but reports
-`runtime_device_injection_unavailable`. In both cases it does not start the
-accelerator workload. Do not treat the current reservation as production GPU or
-DLA isolation.
+A2-only agents treat the reservation as logical ownership and do not start the
+accelerator workload. A compatible Linux agent advertises
+`accelerator-lifecycle-v1`; the control plane then replaces provisional
+assignments with generation-fenced run/release commands. Claims remain durable
+until an exact runtime stop, `released_ack_pending`, and the server's final
+release acknowledgement complete. A missing or foreign runtime identity fails
+closed and keeps the claim.
 
 ## Runtime adapters
 
@@ -181,12 +181,19 @@ The adapter is suitable for bootstrap and appliance-style workloads. Prefer
 systemd when a host service needs richer dependency, logging, user, cgroup, or
 restart policy management.
 
+For accelerator workloads, process execution uses a transient systemd service
+with `DevicePolicy=closed`, exact `DeviceAllow` entries, and a verified
+environment. It is unavailable when the local provider cannot supply a
+complete `vendor_verified` host-access plan.
+
 ### systemd
 
-The systemd adapter accepts an existing unit name and calls `systemctl restart`,
-`is-active`, and `stop`. Nimbus does not generate or edit unit files. Provision
-units, users, sandboxing, environment files, and resources with the host image
-or another trusted installation path.
+The systemd adapter accepts an existing unit name. For accelerator workloads,
+Nimbus atomically installs a narrowly scoped runtime drop-in containing the
+exact device policy and fenced operation identity, verifies its fingerprint
+and InvocationID, and removes only that owned drop-in on stop. Provision the
+base unit, user, sandboxing, and dependencies with the host image or another
+trusted installation path.
 
 ### Docker and containerd
 
@@ -195,26 +202,29 @@ rejected. Docker uses `docker`, while the containerd adapter uses `nerdctl` in
 the `nimbus` namespace. Both create a deterministic `nimbus-NAME` container and
 translate the desired restart policy.
 
-Nimbus currently supports image, command, restart policy, and accelerator
-requirements. It does not yet inject CDI/device access or model ports, mounts,
-networks, secrets, or general resource limits in the deployment schema.
+Accelerator containers receive only canonical CDI names resolved from the
+node-private catalog. Nimbus labels them with the allocation, generation,
+revision, operation, and access fingerprint, adopts only a complete identity,
+and stops only the persisted 64-hex container ID. It never substitutes a
+mutable name, `--gpus all`, or a broad device fallback. Ports, mounts, networks,
+secrets, and general resource limits remain outside the deployment schema.
 
 ## Reconciliation
 
 After every successful heartbeat, an orchestration-enabled agent:
 
 1. Fetches its desired-state document.
-2. Strictly validates every deployment and accelerator assignment.
-3. Validates assignments against the same inventory snapshot as the heartbeat.
-4. Loads its atomically stored applied state and accelerator ledger.
-5. Stops workloads absent from desired state or marked `stopped`.
-6. Blocks accelerator workloads before runtime execution until A3 is available.
-7. Keeps a matching healthy CPU revision unchanged.
-8. Restarts an unhealthy CPU workload unless restart policy is `never`.
-9. Stops the old revision, prepares the new artifact, and applies the runtime.
-10. Runs the configured health check up to `failure_threshold` times.
-11. Restores the previous local specification if the new apply fails.
-12. Reports observed state and atomically saves both local records.
+2. Strictly validates every deployment, A2 assignment, and A3 allocation command.
+3. Validates assigned IDs against the same inventory snapshot as the heartbeat.
+4. Loads `applied.json` and the atomic accelerator operation journal.
+5. Processes accelerator releases before runs and persists every mutating phase.
+6. Resolves exact CDI or verified host access and adopts only matching runtimes.
+7. Applies runtime and application health gates, rolling back a failed target.
+8. Restarts an unhealthy active allocation under a rotated local operation fence.
+9. Stops workloads absent from desired state or marked `stopped`.
+10. Keeps a matching healthy CPU revision unchanged.
+11. Restarts an unhealthy CPU workload unless restart policy is `never`.
+12. Reports observed state and atomically saves local records.
 
 Observed states are `pending`, `applying`, `healthy`, `degraded`, `failed`,
 `stopped`, and `blocked`. A runtime outside the agent allowlist reports

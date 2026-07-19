@@ -50,10 +50,10 @@ Nimbus already provides the generic mechanisms required by this roadmap:
 - staged rollout, health checks, rollback, and workload status history.
 
 Nimbus now discovers bounded NVIDIA and Jetson inventory, accepts declarative
-accelerator requirements, and creates exclusive logical reservations on both
-the control plane and agent. It does not yet inject a reserved device into a
-runtime; accelerator deployments remain blocked until Phase 3 supplies that
-privileged boundary.
+accelerator requirements, and reconciles generation-fenced accelerator claims
+through exact CDI or verified host-access plans. The agent persists immutable
+runtime handles before acknowledging release, so a control-plane claim is not
+reused while the previous runtime may still own the device.
 
 ## Non-goals
 
@@ -282,13 +282,28 @@ placement decisions are implemented. Tests cover incompatible requirements,
 no-overcommit, server restart, agent-state recovery, incomplete inventory, and
 confirmed device disappearance. Accelerator workloads intentionally report
 `accelerator_assignment_unavailable` or
-`runtime_device_injection_unavailable` and are not started until A3 is complete.
+`runtime_device_injection_unavailable` and are not started by A2-only agents.
 
 - incompatible nodes are rejected with a precise reason;
 - a device cannot be assigned to two exclusive workloads;
 - reservations recover safely after agent restart.
 
 ### A3 — Runtime integration
+
+**Status: software complete (2026-07-19).** Linux agents with orchestration and
+at least one runtime enabled advertise `accelerator-lifecycle-v1`. The control
+plane persists generation-fenced run/release commands and retains exclusive
+claims until the agent reports an exact stopped handle and receives the final
+release acknowledgement. The agent uses a separate atomic
+`accelerator-journal.json`, write-ahead phases, immutable container IDs or
+systemd InvocationIDs, crash adoption, health-gated rollback, and locally
+fenced restarts. Docker and nerdctl consume only exact CDI names; process and
+systemd require a complete vendor-verified host allowlist and never derive
+broad `/dev` access. Unit, storage-race, API lifecycle, native release, and
+cross-build tests pass. Real NVIDIA CDI, container engine, systemd, and Jetson
+qualification remains required before production rollout; the built-in probes
+currently provide executable CDI bindings only when `nvidia-ctk cdi list`
+confirms the exact device.
 
 - Docker/containerd receive only the reserved CDI devices;
 - process/systemd adapters expose only declared device access;
@@ -319,6 +334,7 @@ The completed A1 slice contained:
 It did not allocate devices or change deployment scheduling. A2 then added
 logical assignment without privileged runtime access. Because A2 never starts
 an accelerator workload, a revision may safely discard and recompute its
-logical reservation. A3 must replace that provisional lifecycle with stop-first
-runtime ownership, injection, rollback, and crash-recovery semantics before
-device access is enabled.
+logical reservation. A3 replaces that provisional lifecycle with stop-first
+runtime ownership, exact injection, rollback, local restart, and crash-recovery
+semantics. A4 builds artifact variants and cache policy on this fenced runtime
+boundary.

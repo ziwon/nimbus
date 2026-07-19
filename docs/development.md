@@ -76,6 +76,10 @@ build.zig.zon                 Package metadata and included paths
 justfile                      Canonical development and operations tasks
 src/main.zig                  Process entry point and CLI dispatch
 src/agent.zig                 Agent heartbeat and reconciliation lifecycle
+src/agent_journal.zig         Crash-safe accelerator operation journal
+src/accelerator_agent.zig     Production lifecycle effect bindings
+src/accelerator_reconciler.zig Fenced accelerator state machine
+src/accelerator_runtime.zig   Exact CDI and host runtime adapters
 src/client.zig                HTTP client operations
 src/config.zig                JSON and environment configuration
 src/heartbeat.zig             Heartbeat schema and local collection
@@ -344,9 +348,9 @@ sends a one-shot heartbeat, lists nodes, and terminates the server gracefully.
 
 `just api-check` verifies readiness, authentication rejection, invalid and
 oversized heartbeats, responsiveness while a slow client is connected, accepted
-heartbeat inspection, deterministic exclusive accelerator reservation, and
-persistence across a server restart. `just integration` combines this with both
-end-to-end demos.
+heartbeat inspection, deterministic exclusive accelerator reservation, fenced
+run/release status transitions, release acknowledgement, and persistence across
+a server restart. `just integration` combines this with both end-to-end demos.
 
 `just orchestration-demo` additionally registers a target node, applies a
 deployment, reconciles a Linux process, verifies healthy assignment state,
@@ -432,6 +436,12 @@ identity, SQLite databases, or Docker data.
 - **Incomplete accelerator inventory:** `partial` and `unavailable` cannot prove
   disappearance. Do not release or reassign an existing reservation until a
   `complete` report establishes the new device set.
+- **Accelerator runtime identity:** never stop by a mutable container name or
+  unit name alone. Persist and verify the complete container ID or systemd
+  InvocationID/configuration fingerprint before every mutating effect.
+- **Accelerator write-ahead order:** persist a mutating journal phase before
+  starting or stopping a runtime. Claims remain held on ambiguity or failed
+  status delivery.
 
 ## Contribution checklist
 

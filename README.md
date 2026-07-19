@@ -13,6 +13,7 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - labels and roles for targeting glasses, drones, vehicles, desktops, and servers;
 - bounded NVIDIA and Jetson accelerator discovery with opaque stable IDs;
 - declarative accelerator requirements with exclusive logical reservations;
+- generation-fenced accelerator execution with exact CDI/runtime handles;
 - a versioned desired-state and reconciliation loop;
 - opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
 - batched rollout, health gates, status history, and automatic rollback;
@@ -238,10 +239,12 @@ previous revision when `auto_rollback` is enabled. Deleting a deployment causes
 agents to stop it on their next reconciliation.
 
 Deployments may also declare accelerator count, kind, vendor, memory, and
-capability requirements. Nimbus A2 selects stable device IDs and persists
-exclusive central and local logical reservations. Actual CDI/device injection
-is an A3 milestone, so accelerator workloads currently report a blocked
-assignment or `runtime_device_injection_unavailable` and are not started.
+capability requirements. Compatible Linux agents negotiate the fenced A3
+lifecycle, receive exclusive generation-scoped claims, and inject only exact
+CDI devices or vendor-verified host allowlists. Claims remain held through
+stop, rollback, crash recovery, and the final release acknowledgement. NVIDIA
+container execution requires the exact device to be present in the local CDI
+catalog; Nimbus never falls back to `all` or broad host-device access.
 
 See [Workload orchestration](docs/orchestration.md) for the schema, runtime
 behavior, security controls, and production limitations.
