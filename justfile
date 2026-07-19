@@ -159,6 +159,29 @@ api-check port="18083" token="api-check-token": build
     printf '%s' "$gpu_desired" | grep -Fq '"name":"gpu-b"'
     ! printf '%s' "$gpu_desired" | grep -Fq '{"deployment":"gpu-b"'
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/gpu-b" | grep -Fq '"reason_code":"accelerator_capacity_exhausted"'
+
+    lifecycle_heartbeat='{"schema_version":3,"node_id":"api-lifecycle","hostname":"api-lifecycle","role":"edge","features":["accelerator-requirements-v1","accelerator-lifecycle-v1"],"platform":{"os":"linux","arch":"x86_64","abi":"gnu"},"resources":{"cpu_count":8},"accelerator_inventory":{"schema_version":1,"status":"complete","accelerators":[{"id":"gpu:nvidia:lifecycle","kind":"gpu","vendor":"NVIDIA","model":"Fixture","source":"fixture","availability":"available","memory_total_bytes":8589934592,"driver_version":null,"runtimes":[],"capabilities":["fp16"]}],"probes":[{"name":"fixture","status":"ok","devices_found":1,"error_name":null}]},"timestamp_unix_ms":1000}'
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$lifecycle_heartbeat" "http://127.0.0.1:$port/v1/heartbeat")" = 202
+    lifecycle_deployment='{"schema_version":1,"name":"lifecycle-api","revision":1,"runtime":{"kind":"process","command":["/bin/true"]},"resources":{"accelerators":{"count":1,"kind":"gpu","vendor":"nvidia","capabilities":["fp16"]}},"targets":{"node_ids":["api-lifecycle"]}}'
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$lifecycle_deployment" "http://127.0.0.1:$port/v1/deployments/lifecycle-api")" = 202
+    lifecycle_desired=$(curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/desired-state")
+    allocation_id=$(printf '%s' "$lifecycle_desired" | python -c 'import json,sys; print(json.load(sys.stdin)["accelerator_allocations"][0]["allocation_id"])')
+    test "$(printf '%s' "$lifecycle_desired" | python -c 'import json,sys; print(json.load(sys.stdin)["accelerator_allocations"][0]["generation"])')" = 1
+    for phase in pending prepared starting_target target_started verifying active; do
+      status_body=$(printf '{"allocation_id":"%s","generation":1,"node_id":"api-lifecycle","deployment":"lifecycle-api","revision":1,"phase":"%s","observed_unix_ms":1001}' "$allocation_id" "$phase")
+      test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$status_body" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/allocation-status")" = 202
+    done
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/lifecycle-api")" = 200
+    lifecycle_release=$(curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/desired-state")
+    test "$(printf '%s' "$lifecycle_release" | python -c 'import json,sys; command=json.load(sys.stdin)["accelerator_allocations"][0]; print("{}:{}".format(command["action"], command["generation"]))')" = release:2
+    stale_body=$(printf '{"allocation_id":"%s","generation":1,"node_id":"api-lifecycle","deployment":"lifecycle-api","revision":1,"phase":"failed","observed_unix_ms":1002}' "$allocation_id")
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$stale_body" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/allocation-status")" = 409
+    for phase in release_requested stopping released_ack_pending; do
+      status_body=$(printf '{"allocation_id":"%s","generation":2,"node_id":"api-lifecycle","deployment":"lifecycle-api","revision":1,"phase":"%s","observed_unix_ms":1003}' "$allocation_id" "$phase")
+      response=$(curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$status_body" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/allocation-status")
+    done
+    printf '%s' "$response" | grep -Fq '"released":true'
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/desired-state" | grep -Fq '"accelerator_allocations":[]'
     kill "$server_pid"
     wait "$server_pid"
     server_pid=""
@@ -175,6 +198,7 @@ api-check port="18083" token="api-check-token": build
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-legacy")" = 200
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-gpu/desired-state" | grep -Fq '"accelerator_assignments":[{"deployment":"gpu-a"'
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/gpu-b" | grep -Fq '"reason_code":"accelerator_capacity_exhausted"'
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/desired-state" | grep -Fq '"accelerator_allocations":[]'
 
 # Run native end-to-end checks.
 integration: demo api-check orchestration-demo
