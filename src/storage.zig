@@ -64,6 +64,7 @@ pub const Registry = struct {
             \\  os TEXT NOT NULL,
             \\  arch TEXT NOT NULL,
             \\  abi TEXT NOT NULL,
+            \\  host_arch TEXT,
             \\  cpu_count INTEGER NOT NULL,
             \\  agent_version TEXT NOT NULL,
             \\  report_json TEXT NOT NULL,
@@ -264,6 +265,17 @@ pub const Registry = struct {
             \\CREATE INDEX IF NOT EXISTS workload_status_history_lookup
             \\  ON workload_status_history(deployment_name, node_id, received_unix_ms DESC);
         );
+        const has_host_arch = blk: {
+            var column = try self.prepare(
+                "SELECT 1 FROM pragma_table_info('nodes') WHERE name='host_arch';",
+            );
+            defer column.finalize();
+            break :blk try column.row();
+        };
+        if (!has_host_arch) try self.exec("ALTER TABLE nodes ADD COLUMN host_arch TEXT;");
+        try self.exec(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms) VALUES (5, 0);",
+        );
     }
 
     pub fn recordHeartbeat(
@@ -298,15 +310,16 @@ pub const Registry = struct {
 
         var upsert = try self.prepare(
             \\INSERT INTO nodes (
-            \\  node_id, hostname, role, os, arch, abi, cpu_count, agent_version,
-            \\  report_json, first_seen_unix_ms, last_seen_unix_ms
-            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\  node_id, hostname, role, os, arch, abi, host_arch, cpu_count,
+            \\  agent_version, report_json, first_seen_unix_ms, last_seen_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             \\ON CONFLICT(node_id) DO UPDATE SET
             \\  hostname=excluded.hostname,
             \\  role=excluded.role,
             \\  os=excluded.os,
             \\  arch=excluded.arch,
             \\  abi=excluded.abi,
+            \\  host_arch=excluded.host_arch,
             \\  cpu_count=excluded.cpu_count,
             \\  agent_version=excluded.agent_version,
             \\  report_json=excluded.report_json,
@@ -319,11 +332,15 @@ pub const Registry = struct {
         try upsert.bindText(4, report.platform.os);
         try upsert.bindText(5, report.platform.arch);
         try upsert.bindText(6, report.platform.abi);
-        try upsert.bindInt64(7, @intCast(report.resources.cpu_count));
-        try upsert.bindText(8, report.agent_version);
-        try upsert.bindText(9, report_json);
-        try upsert.bindInt64(10, received_unix_ms);
+        if (report.platform.host_arch) |host_arch|
+            try upsert.bindText(7, host_arch)
+        else
+            try upsert.bindNull(7);
+        try upsert.bindInt64(8, @intCast(report.resources.cpu_count));
+        try upsert.bindText(9, report.agent_version);
+        try upsert.bindText(10, report_json);
         try upsert.bindInt64(11, received_unix_ms);
+        try upsert.bindInt64(12, received_unix_ms);
         try upsert.done();
 
         var clear_labels = try self.prepare("DELETE FROM node_labels WHERE node_id=?;");
@@ -464,7 +481,7 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var statement = try self.prepare(
-            \\SELECT node_id, hostname, role, os, arch, abi, cpu_count,
+            \\SELECT node_id, hostname, role, os, arch, abi, host_arch, cpu_count,
             \\       agent_version, last_seen_unix_ms
             \\FROM nodes WHERE node_id > ? ORDER BY node_id LIMIT ?;
         );
@@ -493,11 +510,12 @@ pub const Registry = struct {
                     .os = statement.columnText(3),
                     .arch = statement.columnText(4),
                     .abi = statement.columnText(5),
+                    .host_arch = if (statement.columnIsNull(6)) null else statement.columnText(6),
                 },
-                .cpu_count = @intCast(statement.columnInt64(6)),
-                .agent_version = statement.columnText(7),
-                .last_seen_unix_ms = statement.columnInt64(8),
-                .status = status(now_unix_ms, statement.columnInt64(8), stale_after_ms),
+                .cpu_count = @intCast(statement.columnInt64(7)),
+                .agent_version = statement.columnText(8),
+                .last_seen_unix_ms = statement.columnInt64(9),
+                .status = status(now_unix_ms, statement.columnInt64(9), stale_after_ms),
             };
             const item = try std.json.Stringify.valueAlloc(self.allocator, summary, .{});
             defer self.allocator.free(item);
@@ -3068,7 +3086,12 @@ fn lifecycleTestHeartbeat(features: []const []const u8) heartbeat.Heartbeat {
         .hostname = "gpu-edge",
         .role = "edge",
         .features = features,
-        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .platform = .{
+            .os = "linux",
+            .arch = "x86_64",
+            .abi = "gnu",
+            .host_arch = "aarch64",
+        },
         .resources = .{ .cpu_count = 8 },
         .accelerator_inventory = .{
             .status = .complete,
@@ -3118,6 +3141,59 @@ fn applyLifecycleTestDeployment(
     );
     defer std.testing.allocator.free(json);
     try registry.applyDeployment(deployment, json, now_unix_ms);
+}
+
+test "migration five adds runtime host architecture to existing databases" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const database_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_len], "legacy.db" },
+    );
+    defer std.testing.allocator.free(database_path);
+    const database_path_z = try std.testing.allocator.dupeZ(u8, database_path);
+    defer std.testing.allocator.free(database_path_z);
+
+    var old_database: ?*c.sqlite3 = null;
+    try std.testing.expect(c.sqlite3_open_v2(
+        database_path_z.ptr,
+        &old_database,
+        c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE,
+        null,
+    ) == c.SQLITE_OK);
+    errdefer {
+        if (old_database) |database| _ = c.sqlite3_close(database);
+    }
+    const old_schema =
+        \\CREATE TABLE nodes (
+        \\  node_id TEXT PRIMARY KEY, hostname TEXT NOT NULL, role TEXT NOT NULL,
+        \\  os TEXT NOT NULL, arch TEXT NOT NULL, abi TEXT NOT NULL,
+        \\  cpu_count INTEGER NOT NULL, agent_version TEXT NOT NULL,
+        \\  report_json TEXT NOT NULL, first_seen_unix_ms INTEGER NOT NULL,
+        \\  last_seen_unix_ms INTEGER NOT NULL
+        \\);
+        \\CREATE TABLE schema_migrations (
+        \\  version INTEGER PRIMARY KEY, applied_unix_ms INTEGER NOT NULL
+        \\);
+    ;
+    try std.testing.expect(c.sqlite3_exec(old_database.?, old_schema, null, null, null) == c.SQLITE_OK);
+    try std.testing.expect(c.sqlite3_close(old_database.?) == c.SQLITE_OK);
+    old_database = null;
+
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, database_path);
+    defer registry.close();
+    var column = try registry.prepare(
+        "SELECT 1 FROM pragma_table_info('nodes') WHERE name='host_arch';",
+    );
+    defer column.finalize();
+    try std.testing.expect(try column.row());
+    var migration = try registry.prepare(
+        "SELECT 1 FROM schema_migrations WHERE version=5;",
+    );
+    defer migration.finalize();
+    try std.testing.expect(try migration.row());
 }
 
 test "SQLite registry persists and marks nodes stale" {
@@ -4077,7 +4153,12 @@ test "node listing uses stable cursor pagination" {
         .node_id = "edge-01",
         .hostname = "edge-01",
         .role = "edge",
-        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .platform = .{
+            .os = "linux",
+            .arch = "x86_64",
+            .abi = "gnu",
+            .host_arch = "aarch64",
+        },
         .resources = .{ .cpu_count = 4 },
         .timestamp_unix_ms = 1000,
     };
@@ -4095,6 +4176,7 @@ test "node listing uses stable cursor pagination" {
     try std.testing.expect(std.mem.indexOf(u8, first, "\"node_id\":\"edge-02\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"node_id\":\"edge-03\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"next_after\":\"edge-02\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"host_arch\":\"aarch64\"") != null);
 
     const second = try registry.listNodes(1000, 3000, 2, "edge-02");
     defer std.testing.allocator.free(second);

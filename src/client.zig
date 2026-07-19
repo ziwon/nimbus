@@ -110,6 +110,8 @@ fn performRequest(
 ) anyerror!SendResult {
     var http_client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
     defer http_client.deinit();
+    if (init.environ_map.get("NIMBUS_CA_FILE")) |path|
+        try configureCertificateAuthorities(init, &http_client, path);
 
     var headers: [3]std.http.Header = undefined;
     headers[0] = .{ .name = "accept", .value = "application/json" };
@@ -135,4 +137,23 @@ fn performRequest(
         .extra_headers = headers[0..header_count],
     });
     return .{ .status = result.status, .response_body = response_writer.buffered() };
+}
+
+fn configureCertificateAuthorities(
+    init: std.process.Init,
+    http_client: *std.http.Client,
+    path: []const u8,
+) !void {
+    if (path.len == 0) return error.InvalidCertificateAuthorityPath;
+    const now = std.Io.Clock.real.now(init.io);
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    errdefer bundle.deinit(init.gpa);
+    try bundle.rescan(init.gpa, init.io, now);
+    if (std.fs.path.isAbsolute(path)) {
+        try bundle.addCertsFromFilePathAbsolute(init.gpa, init.io, now, path);
+    } else {
+        try bundle.addCertsFromFilePath(init.gpa, init.io, now, std.Io.Dir.cwd(), path);
+    }
+    http_client.ca_bundle = bundle;
+    http_client.now = now;
 }

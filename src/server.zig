@@ -12,6 +12,7 @@ const storage = @import("storage.zig");
 const max_heartbeat_bytes = 64 * 1024;
 const max_deployment_bytes = 1024 * 1024;
 const max_status_bytes = 64 * 1024;
+const max_token_bytes = 4096;
 const max_concurrent_connections = 64;
 const request_timeout_seconds = 15;
 const json_header = [_]std.http.Header{
@@ -25,14 +26,17 @@ pub const Options = struct {
     stale_after_seconds: u64,
     token: ?[]const u8,
     admin_token: ?[]const u8,
+    node_token_dir: ?[]const u8 = null,
     allow_insecure_no_auth: bool = false,
 };
 
 pub fn serve(init: std.process.Init, options: Options) !void {
     if (options.stale_after_seconds == 0) return error.InvalidStaleTimeout;
-    if (options.token == null and !isLoopbackBind(options.bind_address) and
-        !options.allow_insecure_no_auth)
-        return error.AuthenticationRequired;
+    if (!authenticationConfigured(options)) return error.AuthenticationRequired;
+    if (options.node_token_dir) |path| {
+        var directory = try Io.Dir.cwd().openDir(init.io, path, .{});
+        directory.close(init.io);
+    }
     if (!std.mem.eql(u8, options.database_path, ":memory:")) {
         if (std.fs.path.dirname(options.database_path)) |parent| {
             if (parent.len > 0) try Io.Dir.cwd().createDirPath(init.io, parent);
@@ -98,6 +102,7 @@ fn handleConnectionTask(
     defer connection_permits.post(init.io);
     handleConnection(init, registry, options, stream) catch |err| {
         if (err == error.Canceled) return error.Canceled;
+        if (shutdown.isRequested()) return;
         const message = std.fmt.allocPrint(init.gpa, "request failed: {t}\n", .{err}) catch return;
         defer init.gpa.free(message);
         Io.File.stderr().writeStreamingAll(init.io, message) catch {};
@@ -145,19 +150,19 @@ fn handleConnection(
         return respondJson(&request, "{\"status\":\"not_ready\"}\n", .service_unavailable);
     }
 
-    if (!isAuthorized(&request, requiredToken(options, request.head.target))) {
-        return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
-    }
-
     if (request.head.method == .POST and std.mem.eql(u8, request.head.target, "/v1/heartbeat")) {
-        return ingestHeartbeat(init, registry, &request);
+        if (options.node_token_dir == null and !isAuthorized(&request, options.token))
+            return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
+        return ingestHeartbeat(init, registry, options, bearerToken(&request), &request);
     }
 
     if (desiredStateNodeId(request.head.target)) |node_id| {
-        if (request.head.method != .GET)
-            return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
         if (!identity.isValid(node_id))
             return respondJson(&request, "{\"error\":\"invalid_node_id\"}\n", .bad_request);
+        if (!try isNodeAuthorized(init, bearerToken(&request), options, node_id))
+            return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
+        if (request.head.method != .GET)
+            return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
         const now = Io.Clock.real.now(init.io).toMilliseconds();
         if (try registry.desiredStateForNode(node_id, now)) |response| {
             defer init.gpa.free(response);
@@ -167,16 +172,27 @@ fn handleConnection(
     }
 
     if (statusNodeId(request.head.target)) |node_id| {
+        if (!identity.isValid(node_id))
+            return respondJson(&request, "{\"error\":\"invalid_node_id\"}\n", .bad_request);
+        if (!try isNodeAuthorized(init, bearerToken(&request), options, node_id))
+            return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
         if (request.head.method != .POST)
             return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
         return ingestWorkloadStatus(init, registry, &request, node_id);
     }
 
     if (allocationStatusNodeId(request.head.target)) |node_id| {
+        if (!identity.isValid(node_id))
+            return respondJson(&request, "{\"error\":\"invalid_node_id\"}\n", .bad_request);
+        if (!try isNodeAuthorized(init, bearerToken(&request), options, node_id))
+            return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
         if (request.head.method != .POST)
             return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
         return ingestAllocationStatus(init, registry, &request, node_id);
     }
+
+    if (!isAuthorized(&request, operatorToken(options)))
+        return respondJson(&request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
 
     if (std.mem.eql(u8, request.head.target, "/v1/deployments")) {
         if (request.head.method != .GET)
@@ -268,6 +284,18 @@ fn isLoopbackBind(address: []const u8) bool {
     return std.mem.eql(u8, address, "::1") or
         std.mem.eql(u8, address, "localhost") or
         std.mem.startsWith(u8, address, "127.");
+}
+
+fn authenticationConfigured(options: Options) bool {
+    if (isLoopbackBind(options.bind_address) or options.allow_insecure_no_auth) return true;
+    const node_auth_configured = options.node_token_dir != null or options.token != null;
+    const operator_auth_configured = operatorToken(options) != null;
+    return node_auth_configured and operator_auth_configured;
+}
+
+fn operatorToken(options: Options) ?[]const u8 {
+    return options.admin_token orelse
+        if (options.node_token_dir == null) options.token else null;
 }
 
 const NodePage = struct {
@@ -428,6 +456,8 @@ fn nodeSubresource(target: []const u8, suffix: []const u8) ?[]const u8 {
 fn ingestHeartbeat(
     init: std.process.Init,
     registry: *storage.Registry,
+    options: Options,
+    provided_token: ?[]const u8,
     request: *std.http.Server.Request,
 ) !void {
     var body_buffer: [4096]u8 = undefined;
@@ -441,6 +471,12 @@ fn ingestHeartbeat(
     var parsed = std.json.parseFromSlice(heartbeat.Heartbeat, init.gpa, body, .{}) catch
         return respondJson(request, "{\"error\":\"invalid_heartbeat_json\"}\n", .bad_request);
     defer parsed.deinit();
+    if (options.node_token_dir != null) {
+        if (!identity.isValid(parsed.value.node_id))
+            return respondJson(request, "{\"error\":\"invalid_heartbeat\"}\n", .bad_request);
+        if (!try isNodeAuthorized(init, provided_token, options, parsed.value.node_id))
+            return respondJson(request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
+    }
     if (!validHeartbeat(parsed.value))
         return respondJson(request, "{\"error\":\"invalid_heartbeat\"}\n", .bad_request);
 
@@ -465,33 +501,45 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
             if (std.mem.eql(u8, previous.key, label.key)) return false;
         }
     }
+    if (value.platform.host_arch) |host_arch| {
+        if (host_arch.len == 0 or host_arch.len > 32) return false;
+    }
     return switch (value.schema_version) {
-        1 => value.accelerator_inventory == null and value.placement_telemetry == null and
+        1 => value.platform.host_arch == null and value.accelerator_inventory == null and
+            value.placement_telemetry == null and
             value.features.len == 0,
-        2 => value.placement_telemetry == null and value.features.len == 0 and
+        2 => value.platform.host_arch == null and value.placement_telemetry == null and
+            value.features.len == 0 and
             validAcceleratorInventory(value.accelerator_inventory),
-        3 => value.placement_telemetry == null and validFeatures(value.features) and
+        3 => value.platform.host_arch == null and value.placement_telemetry == null and
+            validFeatures(value.features) and
             validAcceleratorInventory(value.accelerator_inventory) and
             !featurePresent(value.features, heartbeat.feature_edge_placement_v1) and
             (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
                 featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
             (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
                 featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)),
-        heartbeat.current_schema_version => validFeatures(value.features) and
-            validAcceleratorInventory(value.accelerator_inventory) and
-            (if (value.placement_telemetry) |telemetry|
-                placement.validateTelemetry(telemetry) and
-                    featurePresent(value.features, heartbeat.feature_edge_placement_v1)
-            else
-                !featurePresent(value.features, heartbeat.feature_edge_placement_v1)) and
-            (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
-                featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
-            (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
-                featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)) and
-            (!featurePresent(value.features, heartbeat.feature_edge_placement_v1) or
-                featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)),
+        4 => value.platform.host_arch == null and validCurrentHeartbeat(value),
+        heartbeat.current_schema_version => value.platform.host_arch != null and
+            validCurrentHeartbeat(value),
         else => false,
     };
+}
+
+fn validCurrentHeartbeat(value: heartbeat.Heartbeat) bool {
+    return validFeatures(value.features) and
+        validAcceleratorInventory(value.accelerator_inventory) and
+        (if (value.placement_telemetry) |telemetry|
+            placement.validateTelemetry(telemetry) and
+                featurePresent(value.features, heartbeat.feature_edge_placement_v1)
+        else
+            !featurePresent(value.features, heartbeat.feature_edge_placement_v1)) and
+        (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
+            featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
+        (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
+            featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)) and
+        (!featurePresent(value.features, heartbeat.feature_edge_placement_v1) or
+            featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1));
 }
 
 fn validAcceleratorInventory(inventory: ?accelerator.InventoryReport) bool {
@@ -529,15 +577,20 @@ fn featurePresent(features: []const []const u8, expected: []const u8) bool {
 
 fn isAuthorized(request: *const std.http.Server.Request, token: ?[]const u8) bool {
     const required = token orelse return true;
+    const provided = bearerToken(request) orelse return false;
+    return secureTokenEqual(provided, required);
+}
+
+fn bearerToken(request: *const std.http.Server.Request) ?[]const u8 {
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "authorization")) continue;
         const prefix = "Bearer ";
-        return header.value.len == prefix.len + required.len and
-            std.ascii.startsWithIgnoreCase(header.value, prefix) and
-            secureTokenEqual(header.value[prefix.len..], required);
+        if (!std.ascii.startsWithIgnoreCase(header.value, prefix) or
+            header.value.len == prefix.len) return null;
+        return header.value[prefix.len..];
     }
-    return false;
+    return null;
 }
 
 fn secureTokenEqual(provided: []const u8, expected: []const u8) bool {
@@ -550,12 +603,31 @@ fn secureTokenEqual(provided: []const u8, expected: []const u8) bool {
     return std.crypto.timing_safe.eql([Sha256.digest_length]u8, provided_hash, expected_hash);
 }
 
-fn requiredToken(options: Options, target: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, target, "/v1/heartbeat") or
-        desiredStateNodeId(target) != null or statusNodeId(target) != null or
-        allocationStatusNodeId(target) != null)
-        return options.token;
-    return options.admin_token orelse options.token;
+fn isNodeAuthorized(
+    init: std.process.Init,
+    provided_token: ?[]const u8,
+    options: Options,
+    node_id: []const u8,
+) !bool {
+    const directory = options.node_token_dir orelse
+        return if (options.token) |token|
+            if (provided_token) |provided| secureTokenEqual(provided, token) else false
+        else
+            true;
+    if (!identity.isValid(node_id)) return false;
+
+    const path = try std.fs.path.join(init.gpa, &.{ directory, node_id });
+    defer init.gpa.free(path);
+    var file = Io.Dir.cwd().openFile(init.io, path, .{}) catch return false;
+    defer file.close(init.io);
+    var read_buffer: [1024]u8 = undefined;
+    var reader = file.reader(init.io, &read_buffer);
+    const bytes = reader.interface.allocRemaining(init.gpa, .limited(64 * 1024)) catch return false;
+    defer init.gpa.free(bytes);
+    const token = std.mem.trim(u8, bytes, " \t\r\n");
+    if (token.len == 0 or token.len > max_token_bytes) return false;
+    const provided = provided_token orelse return false;
+    return secureTokenEqual(provided, token);
 }
 
 fn staleMillis(seconds: u64) i64 {
@@ -726,17 +798,22 @@ test "heartbeat version three validates bounded unique features" {
     try std.testing.expect(validHeartbeat(lifecycle));
 }
 
-test "heartbeat version four binds edge placement feature to valid telemetry" {
+test "heartbeat version five adds host architecture to placement telemetry" {
     const base: heartbeat.Heartbeat = .{
-        .node_id = "edge-v4",
-        .hostname = "edge-v4",
+        .node_id = "edge-v5",
+        .hostname = "edge-v5",
         .role = "edge",
         .features = &.{
             heartbeat.feature_accelerator_requirements_v1,
             heartbeat.feature_accelerator_lifecycle_v1,
             heartbeat.feature_edge_placement_v1,
         },
-        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .platform = .{
+            .os = "linux",
+            .arch = "aarch64",
+            .abi = "musl",
+            .host_arch = "x86_64",
+        },
         .resources = .{ .cpu_count = 4 },
         .accelerator_inventory = .{
             .status = .complete,
@@ -757,8 +834,18 @@ test "heartbeat version four binds edge placement feature to valid telemetry" {
     var invalid = base;
     invalid.placement_telemetry = .{ .connectivity_quality_percent = 101 };
     try std.testing.expect(!validHeartbeat(invalid));
+    var missing_host = base;
+    missing_host.platform.host_arch = null;
+    try std.testing.expect(!validHeartbeat(missing_host));
+    var version_four = base;
+    version_four.schema_version = 4;
+    version_four.platform.host_arch = null;
+    try std.testing.expect(validHeartbeat(version_four));
+    version_four.platform.host_arch = "x86_64";
+    try std.testing.expect(!validHeartbeat(version_four));
     var legacy_schema = base;
     legacy_schema.schema_version = 3;
+    legacy_schema.platform.host_arch = null;
     legacy_schema.placement_telemetry = null;
     try std.testing.expect(!validHeartbeat(legacy_schema));
 }
@@ -788,15 +875,14 @@ test "operator routes prefer a separate administrative token" {
         .token = "node-token",
         .admin_token = "admin-token",
     };
-    try std.testing.expectEqualStrings("node-token", requiredToken(options, "/v1/heartbeat").?);
-    try std.testing.expectEqualStrings(
-        "node-token",
-        requiredToken(options, "/v1/nodes/edge-01/desired-state").?,
-    );
     try std.testing.expectEqualStrings(
         "admin-token",
-        requiredToken(options, "/v1/deployments").?,
+        operatorToken(options).?,
     );
+    var scoped = options;
+    scoped.node_token_dir = "/run/secrets/nimbus-node-tokens";
+    scoped.admin_token = null;
+    try std.testing.expect(operatorToken(scoped) == null);
 }
 
 test "only loopback binds may start without authentication by default" {
@@ -805,6 +891,26 @@ test "only loopback binds may start without authentication by default" {
     try std.testing.expect(isLoopbackBind("::1"));
     try std.testing.expect(!isLoopbackBind("0.0.0.0"));
     try std.testing.expect(!isLoopbackBind("192.168.1.10"));
+
+    const base: Options = .{
+        .bind_address = "0.0.0.0",
+        .port = 8080,
+        .database_path = ":memory:",
+        .stale_after_seconds = 90,
+        .token = null,
+        .admin_token = null,
+    };
+    try std.testing.expect(!authenticationConfigured(base));
+    var scoped = base;
+    scoped.node_token_dir = "/run/secrets/nimbus-node-tokens";
+    try std.testing.expect(!authenticationConfigured(scoped));
+    scoped.token = "shared-token";
+    try std.testing.expect(!authenticationConfigured(scoped));
+    scoped.admin_token = "admin-token";
+    try std.testing.expect(authenticationConfigured(scoped));
+    var shared = base;
+    shared.token = "compatibility-token";
+    try std.testing.expect(authenticationConfigured(shared));
 }
 
 test "node list pagination is bounded and validates cursors" {

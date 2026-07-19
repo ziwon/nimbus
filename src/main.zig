@@ -355,6 +355,8 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
         file_config.admin_token,
         file_config.admin_token_file,
     );
+    var node_token_dir = init.environ_map.get("NIMBUS_NODE_TOKEN_DIR") orelse
+        file_config.node_token_dir;
     var allow_insecure_no_auth = try config.envBool(
         init,
         "NIMBUS_ALLOW_INSECURE_NO_AUTH",
@@ -383,6 +385,8 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
         } else if (std.mem.eql(u8, arg, "--admin-token-file")) {
             admin_token = readTokenFile(init, requireValue(init, args, &i, arg)) catch
                 usageAndExit(init, "unable to read admin token file");
+        } else if (std.mem.eql(u8, arg, "--node-token-dir")) {
+            node_token_dir = requireValue(init, args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--allow-insecure-no-auth")) {
             allow_insecure_no_auth = true;
         } else if (std.mem.eql(u8, arg, "--config")) {
@@ -393,6 +397,9 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
     }
     if (stale_after == 0 or stale_after > 30 * 24 * 60 * 60)
         usageAndExit(init, "stale-after must be between 1 second and 30 days");
+    if (node_token_dir) |path| {
+        if (path.len == 0) usageAndExit(init, "node token directory must not be empty");
+    }
     try server.serve(init, .{
         .bind_address = bind_address,
         .port = port,
@@ -400,6 +407,7 @@ fn runServer(init: std.process.Init, file_config: config.FileConfig, args: []con
         .stale_after_seconds = stale_after,
         .token = token,
         .admin_token = admin_token,
+        .node_token_dir = node_token_dir,
         .allow_insecure_no_auth = allow_insecure_no_auth,
     });
 }
@@ -723,6 +731,7 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\  nimbus server [--bind ADDRESS] [--port PORT] [--database PATH]
         \\                [--stale-after SEC] [--token TOKEN | --token-file PATH]
         \\                [--admin-token TOKEN | --admin-token-file PATH]
+        \\                [--node-token-dir PATH]
         \\                [--allow-insecure-no-auth]
         \\  nimbus nodes list [--server URL] [--limit N] [--after NODE_ID]
         \\                    [--token TOKEN | --token-file PATH]
@@ -744,7 +753,8 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\NIMBUS_MAX_ARTIFACT_BYTES, NIMBUS_ARTIFACT_CACHE_BYTES,
         \\NIMBUS_CONNECTIVITY_QUALITY_PERCENT, NIMBUS_POWER_SOURCE,
         \\NIMBUS_POWER_BUDGET_MILLIWATTS, NIMBUS_COST_MICROUNITS_PER_HOUR,
-        \\NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE,
+        \\NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE, NIMBUS_NODE_TOKEN_DIR,
+        \\NIMBUS_CA_FILE,
         \\and NIMBUS_ALLOW_INSECURE_NO_AUTH.
         \\
     ) catch {};

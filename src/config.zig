@@ -24,6 +24,7 @@ pub const FileConfig = struct {
     token_file: ?[]const u8 = null,
     admin_token: ?[]const u8 = null,
     admin_token_file: ?[]const u8 = null,
+    node_token_dir: ?[]const u8 = null,
     bind: ?[]const u8 = null,
     port: ?u16 = null,
     database: ?[]const u8 = null,
