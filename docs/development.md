@@ -267,6 +267,10 @@ For a backward-compatible additive field:
 
 For a breaking change, increment `schema_version` and define an explicit server
 compatibility policy before merging it. Do not silently reinterpret version 1.
+Heartbeat v2 is the current example: the server accepts v1 without accelerator
+claims and v2 with a required, validated inventory, while new agents emit v2.
+Deploy the compatible server first and agents second. Rolling the server back
+below v2 requires rolling agents back first.
 
 ## Changing desired-state or runtime behavior
 

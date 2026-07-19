@@ -78,45 +78,56 @@ Shared fleet tokens remain suitable only for small trusted deployments.
 
 ## Phase 1: accelerator inventory
 
-Extend heartbeat schema version 2 with a list of detected accelerators. Static
+Heartbeat schema version 2 includes detected accelerators. Static
 identity and slowly changing capability data belong in heartbeat inventory;
 high-frequency utilization belongs in a separate sampled telemetry path.
 
-Proposed inventory shape:
+Implemented inventory shape:
 
 ```json
 {
-  "accelerators": [
-    {
-      "id": "nvidia-gpu-7f3c...",
+  "accelerator_inventory": {
+    "schema_version": 1,
+    "status": "complete",
+    "accelerators": [{
+      "id": "gpu:nvidia:7f3c...",
       "kind": "gpu",
-      "vendor": "nvidia",
-      "model": "Jetson Orin",
-      "memory_bytes": 8589934592,
+      "vendor": "NVIDIA",
+      "model": "NVIDIA GPU",
+      "source": "nvidia-smi",
+      "availability": "available",
+      "memory_total_bytes": 8589934592,
       "driver_version": "...",
-      "runtime_versions": { "cuda": "..." },
-      "capabilities": ["fp16", "int8", "dla"]
-    }
-  ]
+      "runtimes": [],
+      "capabilities": ["compute_capability=8.7"]
+    }],
+    "probes": [{
+      "name": "nvidia-smi",
+      "status": "ok",
+      "devices_found": 1,
+      "error_name": null
+    }]
+  }
 }
 ```
 
 Inventory rules:
 
 - `id` is stable and opaque; raw device paths are not identities.
-- Unknown fields from vendor probes are retained only in a bounded extension
-  object.
+- Unknown vendor fields are omitted until the bounded schema explicitly
+  supports them.
 - Probe failure reports `unavailable` with a reason; it must not silently turn
   an accelerator node into a CPU-only node.
 - Sensitive serial numbers are hashed or omitted by default.
 
-Initial probe order:
+The A1 providers are a bounded `nvidia-smi` probe and a Jetson system-file
+fallback that discovers the integrated GPU and numbered DLA devices. Future
+provider order is:
 
-1. NVIDIA NVML, with a constrained command fallback where NVML is unavailable;
-2. Jetson GPU and DLA capability discovery;
-3. Intel Level Zero;
-4. AMD ROCm SMI;
-5. plugin probes for Coral, Hailo, Rockchip, and other edge NPUs.
+1. NVIDIA NVML when it can preserve static-build and timeout guarantees;
+2. Intel Level Zero;
+3. AMD ROCm SMI;
+4. plugin probes for Coral, Hailo, Rockchip, and other edge NPUs.
 
 Each probe implements a small interface and runs with a time and output bound.
 A failed optional vendor library must not prevent the agent from starting.
@@ -232,6 +243,14 @@ explicitly requests that behavior.
 ## Milestones and acceptance criteria
 
 ### A1 — Inventory
+
+**Status: software complete (2026-07-19).** Heartbeat v2, bounded providers,
+trust-boundary validation, raw report persistence, node inspection, and v1/v2
+coexistence are implemented. Fixture tests cover CPU-only, missing providers,
+timeout outcomes, malformed output, disappearance, and Jetson GPU/DLA IDs. An
+NVIDIA RTX host was smoke-tested for repeatable opaque identity. Jetson hardware
+qualification across reboot remains open and must complete before A2 is used on
+production Jetson nodes.
 
 - NVIDIA and Jetson probes return stable, schema-versioned inventory.
 - CPU-only and missing-driver systems remain functional.

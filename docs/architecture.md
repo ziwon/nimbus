@@ -22,6 +22,7 @@ Nimbus currently provides:
 
 - stable node identity, roles, and labels;
 - periodic heartbeat, platform inventory, and online/stale state;
+- bounded NVIDIA and Jetson accelerator inventory with opaque device IDs;
 - desired-state storage and agent-side reconciliation;
 - process, systemd, Docker, and containerd/nerdctl adapters behind an allowlist;
 - runtime, HTTP, TCP, and direct-command health checks;
@@ -33,8 +34,8 @@ Nimbus currently provides:
 - static Linux and native Windows/macOS cross-builds.
 
 Resource-aware scheduling, service discovery, overlay networking, distributed
-storage, secrets delivery, GPU allocation, high-availability control planes,
-and per-node cryptographic identity are outside the current implementation.
+storage, secrets delivery, accelerator allocation, high-availability control
+planes, and per-node cryptographic identity are outside the current implementation.
 
 ## Why Zig
 
@@ -98,6 +99,7 @@ flowchart TB
     Config[config.zig<br/>strict JSON/env]
     Identity[identity.zig<br/>node identity]
     Heartbeat[heartbeat.zig<br/>inventory and labels]
+    Accelerator[accelerator.zig<br/>bounded hardware probes]
     Agent[agent.zig<br/>lifecycle and retry]
     Reconcile[reconciler.zig<br/>desired/current diff]
     Runtime[runtime.zig<br/>adapters and artifacts]
@@ -112,6 +114,7 @@ flowchart TB
     Main --> Agent
     Main --> Server
     Agent --> Heartbeat
+    Heartbeat --> Accelerator
     Agent --> Reconcile
     Agent --> Client
     Agent --> Shutdown
@@ -129,6 +132,7 @@ flowchart TB
 | `config.zig` | Strict configuration parsing and environment conversion |
 | `identity.zig` | Node-ID validation and atomic identity creation |
 | `heartbeat.zig` | Versioned node report, role, labels, and target metadata |
+| `accelerator.zig` | Generic accelerator types, bounded providers, and claim validation |
 | `agent.zig` | Heartbeat/reconcile loop, jitter, retry, and one-shot behavior |
 | `orchestration.zig` | Desired-state types and trust-boundary validation |
 | `reconciler.zig` | Local diff, apply/stop/restart, health, restore, and status |
@@ -160,7 +164,16 @@ without interpretation.
 ### Discovery and liveness
 
 The agent sends a schema-versioned heartbeat containing node ID, hostname,
-role, labels, compiled OS/architecture/ABI, CPU count, version, and timestamp.
+role, labels, compiled OS/architecture/ABI, CPU count, accelerator inventory,
+version, and timestamp. Heartbeat v2 distinguishes a trustworthy empty
+`complete` inventory from `partial` or `unavailable` probe results. NVIDIA UUIDs
+are converted to node-scoped opaque hashes; Jetson GPU and DLA identities use
+stable functional slots.
+
+The server accepts heartbeat versions 1 and 2 during rolling upgrades. Version
+1 means accelerator inventory was not reported, while version 2 requires a
+bounded and internally consistent inventory. Servers must be upgraded before
+agents because a version 1 server rejects version 2 heartbeats.
 The server stores both agent time and server receipt time. Online/stale state is
 derived from receipt time, avoiding trust in device clock accuracy.
 
@@ -267,7 +280,10 @@ concurrently through `std.Io.Group`, bounded to 64 active handlers with a
 shared SQLite connection and protects multi-statement transactions. Current node
 state is updated on every heartbeat; history is sampled every five minutes and
 retained for seven days. Audit events and workload status history are retained
-for 30 days.
+for 30 days. A1 accelerator inventory remains inside the canonical
+`report_json`, so node inspection preserves v1 and v2 reports without a schema
+migration. Queryable accelerator and last-known tables are deferred until A2
+scheduling semantics require them.
 
 This architecture handles overlapping edge requests without claiming
 horizontal control-plane scale. One server process and one database remain the
