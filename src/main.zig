@@ -2,10 +2,13 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 const accelerator = @import("accelerator.zig");
+const allocation = @import("allocation.zig");
 const agent = @import("agent.zig");
 const client = @import("client.zig");
 const config = @import("config.zig");
+const device_access = @import("device_access.zig");
 const heartbeat = @import("heartbeat.zig");
+const host_runtime = @import("host_runtime.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
 const reconciler = @import("reconciler.zig");
@@ -667,9 +670,12 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
 
 test {
     _ = accelerator;
+    _ = allocation;
     _ = agent;
     _ = config;
+    _ = device_access;
     _ = heartbeat;
+    _ = host_runtime;
     _ = identity;
     _ = orchestration;
     _ = reconciler;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const client = @import("client.zig");
+const device_access = @import("device_access.zig");
 const orchestration = @import("orchestration.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -42,6 +43,17 @@ pub const ApplyResult = struct {
     process_start_ticks: ?u64 = null,
 };
 
+pub const OwnedCommand = struct {
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+
+    pub fn deinit(self: *OwnedCommand) void {
+        for (self.argv) |argument| self.allocator.free(argument);
+        self.allocator.free(self.argv);
+        self.* = undefined;
+    }
+};
+
 pub const Options = struct {
     enabled: Enabled,
     state_dir: []const u8,
@@ -76,20 +88,35 @@ pub fn apply(
     deployment: orchestration.Deployment,
     artifact_path: ?[]const u8,
 ) !ApplyResult {
+    return applyWithAccess(init, deployment, artifact_path, null);
+}
+
+pub fn applyWithAccess(
+    init: std.process.Init,
+    deployment: orchestration.Deployment,
+    artifact_path: ?[]const u8,
+    access_plan: ?device_access.Plan,
+) !ApplyResult {
+    if (access_plan != null and builtin.os.tag != .linux)
+        return error.RuntimeUnsupported;
     return switch (deployment.runtime.kind) {
-        .process => try startProcess(init, deployment, artifact_path),
+        .process => if (access_plan == null)
+            try startProcess(init, deployment, artifact_path)
+        else
+            error.HostDeviceIsolationUnavailable,
         .systemd => {
+            if (access_plan != null) return error.HostDeviceIsolationUnavailable;
             const unit = deployment.runtime.reference.?;
             if (!try commandSucceeded(init, &.{ "systemctl", "restart", "--", unit }, 60))
                 return error.RuntimeApplyFailed;
             return .{};
         },
         .docker => {
-            try replaceContainer(init, "docker", deployment);
+            try replaceContainer(init, "docker", deployment, access_plan);
             return .{};
         },
         .containerd => {
-            try replaceContainer(init, "nerdctl", deployment);
+            try replaceContainer(init, "nerdctl", deployment, access_plan);
             return .{};
         },
     };
@@ -339,40 +366,271 @@ fn parseProcessStartTicks(stat: []const u8) !u64 {
     return error.InvalidProcessStat;
 }
 
+pub fn buildContainerRunCommand(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    deployment: orchestration.Deployment,
+    access_plan: ?device_access.Plan,
+) !OwnedCommand {
+    const is_nerdctl = std.mem.eql(u8, executable, "nerdctl");
+    if (!is_nerdctl and !std.mem.eql(u8, executable, "docker"))
+        return error.UnsupportedContainerRuntime;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (argv.items) |argument| allocator.free(argument);
+        argv.deinit(allocator);
+    }
+    try appendOwnedArgument(allocator, &argv, executable);
+    if (is_nerdctl) {
+        try appendOwnedArgument(allocator, &argv, "--namespace");
+        try appendOwnedArgument(allocator, &argv, "nimbus");
+    }
+    const run_arguments = [_][]const u8{ "run", "-d", "--name" };
+    for (&run_arguments) |argument|
+        try appendOwnedArgument(allocator, &argv, argument);
+    const container_name = try std.fmt.allocPrint(allocator, "nimbus-{s}", .{deployment.name});
+    defer allocator.free(container_name);
+    try appendOwnedArgument(allocator, &argv, container_name);
+
+    try appendOwnedArgument(allocator, &argv, "--label");
+    try appendOwnedArgument(allocator, &argv, "io.nimbus.managed=true");
+    try appendOwnedArgument(allocator, &argv, "--label");
+    const deployment_label = try std.fmt.allocPrint(
+        allocator,
+        "io.nimbus.deployment={s}",
+        .{deployment.name},
+    );
+    defer allocator.free(deployment_label);
+    try appendOwnedArgument(allocator, &argv, deployment_label);
+    try appendOwnedArgument(allocator, &argv, "--label");
+    const revision_label = try std.fmt.allocPrint(
+        allocator,
+        "io.nimbus.revision={d}",
+        .{deployment.revision},
+    );
+    defer allocator.free(revision_label);
+    try appendOwnedArgument(allocator, &argv, revision_label);
+
+    if (access_plan) |plan| {
+        if (plan.device_ids.len == 0) return error.NoAssignedDevices;
+        switch (plan.access) {
+            .host => return error.ContainerHostAccessUnsupported,
+            .cdi => |cdi_devices| {
+                if (cdi_devices.len == 0) return error.MissingCdiDevices;
+                const fingerprint_hex = std.fmt.bytesToHex(plan.fingerprint, .lower);
+                try appendOwnedArgument(allocator, &argv, "--label");
+                const access_label = try std.fmt.allocPrint(
+                    allocator,
+                    "io.nimbus.accelerator-assignment={s}",
+                    .{fingerprint_hex},
+                );
+                defer allocator.free(access_label);
+                try appendOwnedArgument(allocator, &argv, access_label);
+                for (cdi_devices, 0..) |cdi_device, index| {
+                    if (!device_access.isValidCdiDevice(cdi_device))
+                        return error.InvalidCdiDevice;
+                    for (cdi_devices[0..index]) |previous| {
+                        if (std.mem.eql(u8, previous, cdi_device))
+                            return error.DuplicateCdiDevice;
+                    }
+                    try appendOwnedArgument(allocator, &argv, "--device");
+                    try appendOwnedArgument(allocator, &argv, cdi_device);
+                }
+            },
+        }
+    }
+
+    if (deployment.restart_policy != .never) {
+        try appendOwnedArgument(allocator, &argv, "--restart");
+        try appendOwnedArgument(allocator, &argv, restartName(deployment.restart_policy));
+    }
+    try appendOwnedArgument(
+        allocator,
+        &argv,
+        deployment.runtime.reference orelse return error.ContainerImageRequired,
+    );
+    for (deployment.runtime.command) |argument|
+        try appendOwnedArgument(allocator, &argv, argument);
+
+    return .{
+        .allocator = allocator,
+        .argv = try argv.toOwnedSlice(allocator),
+    };
+}
+
+fn appendOwnedArgument(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    value: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try argv.append(allocator, owned);
+}
+
+const ContainerOwnershipState = enum { absent, owned, foreign };
+
+const ContainerOwnership = struct {
+    state: ContainerOwnershipState,
+    container_id: ?[]u8 = null,
+
+    fn deinit(self: *ContainerOwnership, allocator: std.mem.Allocator) void {
+        if (self.container_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+fn inspectContainerOwnership(
+    init: std.process.Init,
+    executable: []const u8,
+    container_name: []const u8,
+    deployment_name: []const u8,
+) !ContainerOwnership {
+    const listed_id = try findContainerId(init, executable, container_name) orelse
+        return .{ .state = .absent };
+    defer init.gpa.free(listed_id);
+    const format = "{{.Id}}\n{{index .Config.Labels \"io.nimbus.managed\"}}\n" ++
+        "{{index .Config.Labels \"io.nimbus.deployment\"}}";
+    const argv: []const []const u8 = if (std.mem.eql(u8, executable, "nerdctl"))
+        &.{ executable, "--namespace", "nimbus", "inspect", "-f", format, listed_id }
+    else if (std.mem.eql(u8, executable, "docker"))
+        &.{ executable, "inspect", "-f", format, listed_id }
+    else
+        return error.UnsupportedContainerRuntime;
+    const result = try std.process.run(init.gpa, init.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .clock = .boot, .raw = .fromSeconds(10) } },
+    });
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) return error.RuntimeInspectFailed;
+
+    var ownership = try parseContainerOwnership(init.gpa, result.stdout, deployment_name);
+    errdefer ownership.deinit(init.gpa);
+    if (ownership.container_id) |full_id| {
+        if (!std.mem.startsWith(u8, full_id, listed_id))
+            return error.RuntimeInspectIdentityMismatch;
+    }
+    return ownership;
+}
+
+fn findContainerId(
+    init: std.process.Init,
+    executable: []const u8,
+    container_name: []const u8,
+) !?[]u8 {
+    const format = "{{.ID}}\t{{.Names}}";
+    const argv: []const []const u8 = if (std.mem.eql(u8, executable, "nerdctl"))
+        &.{ executable, "--namespace", "nimbus", "ps", "-a", "--format", format }
+    else if (std.mem.eql(u8, executable, "docker"))
+        &.{ executable, "ps", "-a", "--format", format }
+    else
+        return error.UnsupportedContainerRuntime;
+    const result = try std.process.run(init.gpa, init.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .clock = .boot, .raw = .fromSeconds(10) } },
+    });
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) return error.RuntimeInspectFailed;
+    return parseContainerList(init.gpa, result.stdout, container_name);
+}
+
+fn parseContainerList(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    container_name: []const u8,
+) !?[]u8 {
+    var found: ?[]u8 = null;
+    errdefer if (found) |value| allocator.free(value);
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        const separator = std.mem.indexOfScalar(u8, line, '\t') orelse
+            return error.InvalidRuntimeInspect;
+        const container_id = line[0..separator];
+        const name = line[separator + 1 ..];
+        if (!device_access.isValidDeviceId(container_id) or name.len == 0)
+            return error.InvalidRuntimeInspect;
+        if (!std.mem.eql(u8, name, container_name)) continue;
+        if (found != null) return error.AmbiguousRuntimeHandle;
+        found = try allocator.dupe(u8, container_id);
+    }
+    return found;
+}
+
+fn parseContainerOwnership(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    deployment_name: []const u8,
+) !ContainerOwnership {
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, output, " \t\r\n"), '\n');
+    const container_id = std.mem.trim(u8, lines.next() orelse return error.InvalidRuntimeInspect, " \t\r");
+    const managed = std.mem.trim(u8, lines.next() orelse return error.InvalidRuntimeInspect, " \t\r");
+    const deployment = std.mem.trim(u8, lines.next() orelse return error.InvalidRuntimeInspect, " \t\r");
+    if (lines.next() != null or !device_access.isValidDeviceId(container_id))
+        return error.InvalidRuntimeInspect;
+    if (!std.mem.eql(u8, managed, "true") or
+        !std.mem.eql(u8, deployment, deployment_name))
+        return .{ .state = .foreign };
+    return .{
+        .state = .owned,
+        .container_id = try allocator.dupe(u8, container_id),
+    };
+}
+
 fn replaceContainer(
     init: std.process.Init,
     executable: []const u8,
     deployment: orchestration.Deployment,
+    access_plan: ?device_access.Plan,
 ) !void {
-    const container_name = try std.fmt.allocPrint(init.gpa, "nimbus-{s}", .{deployment.name});
-    defer init.gpa.free(container_name);
-    removeContainer(init, executable, deployment.name) catch {};
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(init.gpa);
-    try argv.append(init.gpa, executable);
-    if (std.mem.eql(u8, executable, "nerdctl")) {
-        try argv.appendSlice(init.gpa, &.{ "--namespace", "nimbus" });
-    }
-    try argv.appendSlice(init.gpa, &.{ "run", "-d", "--name", container_name });
-    if (deployment.restart_policy != .never)
-        try argv.appendSlice(init.gpa, &.{ "--restart", restartName(deployment.restart_policy) });
-    try argv.append(init.gpa, deployment.runtime.reference.?);
-    try argv.appendSlice(init.gpa, deployment.runtime.command);
-    if (!try commandSucceeded(init, argv.items, 300)) return error.RuntimeApplyFailed;
+    var command = try buildContainerRunCommand(
+        init.gpa,
+        executable,
+        deployment,
+        access_plan,
+    );
+    defer command.deinit();
+    // Fully validate and own the replacement command before stopping the
+    // currently healthy container.
+    try removeContainer(init, executable, deployment.name);
+    if (!try commandSucceeded(init, command.argv, 300)) return error.RuntimeApplyFailed;
 }
 
 fn removeContainer(init: std.process.Init, executable: []const u8, name: []const u8) !void {
     const container_name = try std.fmt.allocPrint(init.gpa, "nimbus-{s}", .{name});
     defer init.gpa.free(container_name);
+    var ownership = try inspectContainerOwnership(init, executable, container_name, name);
+    defer ownership.deinit(init.gpa);
+    switch (ownership.state) {
+        .absent => return,
+        .foreign => return error.RuntimeHandleConflict,
+        .owned => {},
+    }
+    const container_id = ownership.container_id.?;
     if (std.mem.eql(u8, executable, "nerdctl")) {
         if (!try commandSucceeded(
             init,
-            &.{ executable, "--namespace", "nimbus", "rm", "-f", container_name },
+            &.{ executable, "--namespace", "nimbus", "rm", "-f", container_id },
             60,
         )) return error.RuntimeStopFailed;
     } else {
-        if (!try commandSucceeded(init, &.{ executable, "rm", "-f", container_name }, 60))
+        if (!try commandSucceeded(init, &.{ executable, "rm", "-f", container_id }, 60))
             return error.RuntimeStopFailed;
     }
 }
@@ -380,10 +638,14 @@ fn removeContainer(init: std.process.Init, executable: []const u8, name: []const
 fn containerHealthy(init: std.process.Init, executable: []const u8, name: []const u8) !bool {
     const container_name = try std.fmt.allocPrint(init.gpa, "nimbus-{s}", .{name});
     defer init.gpa.free(container_name);
+    var ownership = try inspectContainerOwnership(init, executable, container_name, name);
+    defer ownership.deinit(init.gpa);
+    if (ownership.state != .owned) return false;
+    const container_id = ownership.container_id.?;
     const argv: []const []const u8 = if (std.mem.eql(u8, executable, "nerdctl"))
-        &.{ executable, "--namespace", "nimbus", "inspect", "-f", "{{.State.Running}}", container_name }
+        &.{ executable, "--namespace", "nimbus", "inspect", "-f", "{{.State.Running}}", container_id }
     else
-        &.{ executable, "inspect", "-f", "{{.State.Running}}", container_name };
+        &.{ executable, "inspect", "-f", "{{.State.Running}}", container_id };
     const result = try std.process.run(init.gpa, init.io, .{
         .argv = argv,
         .stdout_limit = .limited(4096),
@@ -618,4 +880,208 @@ test "Linux process identity parser handles spaces in command names" {
             "123 (vision worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 0",
         ),
     );
+}
+
+test "Docker command injects only exact reserved CDI devices" {
+    const inventory = [_][]const u8{"gpu:nvidia:opaque"};
+    const bindings = [_]device_access.LocalBinding{.{
+        .device_id = inventory[0],
+        .cdi_devices = &.{"nvidia.com/gpu=GPU-exact"},
+    }};
+    var access = try device_access.resolveAlloc(
+        std.testing.allocator,
+        &inventory,
+        .{ .bindings = &bindings },
+        &inventory,
+        .cdi_only,
+    );
+    defer access.deinit();
+    const deployment: orchestration.Deployment = .{
+        .name = "vision",
+        .revision = 7,
+        .runtime = .{
+            .kind = .docker,
+            .reference = "registry.example/vision@sha256:" ++ ("ab" ** 32),
+            .command = &.{ "serve", "--port=9000" },
+        },
+        .restart_policy = .on_failure,
+        .targets = .{ .all = true },
+    };
+    var command = try buildContainerRunCommand(
+        std.testing.allocator,
+        "docker",
+        deployment,
+        access.view(),
+    );
+    defer command.deinit();
+
+    try std.testing.expectEqualStrings("docker", command.argv[0]);
+    try std.testing.expect(commandHasPair(command.argv, "--name", "nimbus-vision"));
+    try std.testing.expect(commandHasPair(
+        command.argv,
+        "--label",
+        "io.nimbus.managed=true",
+    ));
+    try std.testing.expect(commandHasPair(
+        command.argv,
+        "--label",
+        "io.nimbus.deployment=vision",
+    ));
+    try std.testing.expect(commandHasPair(
+        command.argv,
+        "--device",
+        "nvidia.com/gpu=GPU-exact",
+    ));
+    try std.testing.expect(!commandContains(command.argv, "--gpus"));
+    try std.testing.expect(!commandContains(command.argv, "--privileged"));
+    try std.testing.expect(!commandContains(command.argv, "nvidia.com/gpu=all"));
+    const device_index = commandIndex(command.argv, "nvidia.com/gpu=GPU-exact").?;
+    const image_index = commandIndex(
+        command.argv,
+        "registry.example/vision@sha256:" ++ ("ab" ** 32),
+    ).?;
+    try std.testing.expect(device_index < image_index);
+}
+
+test "nerdctl command uses the private Nimbus namespace" {
+    const deployment: orchestration.Deployment = .{
+        .name = "worker",
+        .revision = 1,
+        .runtime = .{
+            .kind = .containerd,
+            .reference = "registry.example/worker@sha256:" ++ ("cd" ** 32),
+        },
+        .targets = .{ .all = true },
+    };
+    var command = try buildContainerRunCommand(
+        std.testing.allocator,
+        "nerdctl",
+        deployment,
+        null,
+    );
+    defer command.deinit();
+    try std.testing.expectEqualStrings("nerdctl", command.argv[0]);
+    try std.testing.expectEqualStrings("--namespace", command.argv[1]);
+    try std.testing.expectEqualStrings("nimbus", command.argv[2]);
+}
+
+test "container command rejects raw host access" {
+    const inventory = [_][]const u8{"gpu:nvidia:opaque"};
+    const bindings = [_]device_access.LocalBinding{.{
+        .device_id = inventory[0],
+        .host_access = .{
+            .completeness = .vendor_verified,
+            .device_nodes = &.{.{
+                .path = "/dev/nvidia0",
+                .permissions = .read_write,
+            }},
+        },
+    }};
+    var access = try device_access.resolveAlloc(
+        std.testing.allocator,
+        &inventory,
+        .{ .bindings = &bindings },
+        &inventory,
+        .cdi_or_host,
+    );
+    defer access.deinit();
+    const deployment: orchestration.Deployment = .{
+        .name = "vision",
+        .revision = 1,
+        .runtime = .{
+            .kind = .docker,
+            .reference = "registry.example/vision@sha256:" ++ ("ef" ** 32),
+        },
+        .targets = .{ .all = true },
+    };
+    try std.testing.expectError(
+        error.ContainerHostAccessUnsupported,
+        buildContainerRunCommand(
+            std.testing.allocator,
+            "docker",
+            deployment,
+            access.view(),
+        ),
+    );
+}
+
+test "container ownership requires exact Nimbus labels" {
+    var owned = try parseContainerOwnership(
+        std.testing.allocator,
+        "abcdef012345\ntrue\nvision\n",
+        "vision",
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ContainerOwnershipState.owned, owned.state);
+    try std.testing.expectEqualStrings("abcdef012345", owned.container_id.?);
+
+    var foreign = try parseContainerOwnership(
+        std.testing.allocator,
+        "abcdef012345\nfalse\nvision\n",
+        "vision",
+    );
+    defer foreign.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ContainerOwnershipState.foreign, foreign.state);
+    try std.testing.expectEqual(@as(?[]u8, null), foreign.container_id);
+
+    try std.testing.expectError(
+        error.InvalidRuntimeInspect,
+        parseContainerOwnership(
+            std.testing.allocator,
+            "abcdef012345\ntrue\nvision\nextra\n",
+            "vision",
+        ),
+    );
+}
+
+test "container list confirms absence and rejects ambiguous ownership" {
+    const found = (try parseContainerList(
+        std.testing.allocator,
+        "aaa111\tnimbus-a\nbbb222\tnimbus-vision\n",
+        "nimbus-vision",
+    )).?;
+    defer std.testing.allocator.free(found);
+    try std.testing.expectEqualStrings("bbb222", found);
+
+    try std.testing.expect((try parseContainerList(
+        std.testing.allocator,
+        "aaa111\tnimbus-a\n",
+        "nimbus-missing",
+    )) == null);
+    try std.testing.expectError(
+        error.AmbiguousRuntimeHandle,
+        parseContainerList(
+            std.testing.allocator,
+            "aaa111\tnimbus-vision\nbbb222\tnimbus-vision\n",
+            "nimbus-vision",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRuntimeInspect,
+        parseContainerList(
+            std.testing.allocator,
+            "malformed-without-tab\n",
+            "nimbus-vision",
+        ),
+    );
+}
+
+fn commandHasPair(argv: []const []const u8, key: []const u8, value: []const u8) bool {
+    if (argv.len < 2) return false;
+    for (argv[0 .. argv.len - 1], argv[1..]) |candidate_key, candidate_value| {
+        if (std.mem.eql(u8, candidate_key, key) and
+            std.mem.eql(u8, candidate_value, value)) return true;
+    }
+    return false;
+}
+
+fn commandContains(argv: []const []const u8, expected: []const u8) bool {
+    return commandIndex(argv, expected) != null;
+}
+
+fn commandIndex(argv: []const []const u8, expected: []const u8) ?usize {
+    for (argv, 0..) |argument, index| {
+        if (std.mem.eql(u8, argument, expected)) return index;
+    }
+    return null;
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const device_access = @import("device_access.zig");
 
 pub const max_command_output_bytes = 64 * 1024;
 pub const max_device_count = 32;
@@ -88,6 +89,8 @@ pub const DeviceInput = struct {
     driver_version: ?[]const u8 = null,
     runtimes: []const RuntimeVersion = &.{},
     capabilities: []const []const u8 = &.{},
+    /// Node-local runtime access data. This is never included in report().
+    local_binding: ?device_access.LocalBinding = null,
 };
 
 pub const InventoryStatus = enum {
@@ -123,12 +126,14 @@ pub const Inventory = struct {
     status: InventoryStatus,
     devices: []Device,
     probe_outcomes: []ProbeOutcome,
+    access_catalog: device_access.OwnedCatalog,
 
     pub fn deinit(self: *Inventory) void {
         for (self.devices) |*device| device.deinit(self.allocator);
         self.allocator.free(self.devices);
         for (self.probe_outcomes) |*outcome| outcome.deinit(self.allocator);
         self.allocator.free(self.probe_outcomes);
+        self.access_catalog.deinit();
         self.* = undefined;
     }
 
@@ -143,6 +148,12 @@ pub const Inventory = struct {
             .accelerators = self.devices,
             .probes = self.probe_outcomes,
         };
+    }
+
+    /// Borrowed node-private catalog. It must never cross the heartbeat/API
+    /// trust boundary.
+    pub fn accessCatalog(self: *const Inventory) device_access.Catalog {
+        return self.access_catalog.view();
     }
 };
 
@@ -307,6 +318,7 @@ pub const Collector = struct {
     allocator: std.mem.Allocator,
     limit: usize,
     devices: std.ArrayList(Device) = .empty,
+    access_bindings: std.ArrayList(device_access.LocalBinding) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, limit: usize) Collector {
         return .{ .allocator = allocator, .limit = limit };
@@ -315,6 +327,9 @@ pub const Collector = struct {
     pub fn deinit(self: *Collector) void {
         for (self.devices.items) |*device| device.deinit(self.allocator);
         self.devices.deinit(self.allocator);
+        for (self.access_bindings.items) |binding|
+            deinitAccessBinding(self.allocator, binding);
+        self.access_bindings.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -384,7 +399,20 @@ pub const Collector = struct {
             self.allocator.free(device.capabilities);
         }
 
-        try self.devices.append(self.allocator, device);
+        const owned_binding = if (input.local_binding) |binding| blk: {
+            if (!std.mem.eql(u8, binding.device_id, input.id))
+                return error.InvalidDeviceBinding;
+            try device_access.validateCatalog(&.{input.id}, .{ .bindings = &.{binding} });
+            break :blk try cloneAccessBinding(self.allocator, binding);
+        } else null;
+        errdefer if (owned_binding) |binding|
+            deinitAccessBinding(self.allocator, binding);
+
+        try self.devices.ensureUnusedCapacity(self.allocator, 1);
+        if (owned_binding != null)
+            try self.access_bindings.ensureUnusedCapacity(self.allocator, 1);
+        self.devices.appendAssumeCapacity(device);
+        if (owned_binding) |binding| self.access_bindings.appendAssumeCapacity(binding);
     }
 };
 
@@ -400,6 +428,8 @@ pub const Registry = struct {
 
         var devices: std.ArrayList(Device) = .empty;
         errdefer deinitDeviceList(allocator, &devices);
+        var access_bindings: std.ArrayList(device_access.LocalBinding) = .empty;
+        errdefer deinitAccessBindingList(allocator, &access_bindings);
         var outcomes: std.ArrayList(ProbeOutcome) = .empty;
         errdefer deinitOutcomeList(allocator, &outcomes);
         var incomplete = false;
@@ -434,8 +464,15 @@ pub const Registry = struct {
                 continue;
             }
             try devices.ensureUnusedCapacity(allocator, found);
+            try access_bindings.ensureUnusedCapacity(
+                allocator,
+                collector.access_bindings.items.len,
+            );
             for (collector.devices.items) |device| devices.appendAssumeCapacity(device);
+            for (collector.access_bindings.items) |binding|
+                access_bindings.appendAssumeCapacity(binding);
             collector.devices.items.len = 0;
+            collector.access_bindings.items.len = 0;
             try appendOutcome(
                 allocator,
                 &outcomes,
@@ -456,11 +493,26 @@ pub const Registry = struct {
             allocator.free(owned_devices);
         }
         const owned_outcomes = try outcomes.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_outcomes) |*outcome| outcome.deinit(allocator);
+            allocator.free(owned_outcomes);
+        }
+        var inventory_ids: [max_device_count][]const u8 = undefined;
+        for (owned_devices, 0..) |device, index| inventory_ids[index] = device.id;
+        try device_access.validateCatalog(
+            inventory_ids[0..owned_devices.len],
+            .{ .bindings = access_bindings.items },
+        );
+        const owned_access_bindings = try access_bindings.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
             .status = status,
             .devices = owned_devices,
             .probe_outcomes = owned_outcomes,
+            .access_catalog = .{
+                .allocator = allocator,
+                .bindings = owned_access_bindings,
+            },
         };
     }
 };
@@ -622,11 +674,18 @@ fn emptyUnavailableInventory(allocator: std.mem.Allocator) !Inventory {
     const owned_devices = try devices.toOwnedSlice(allocator);
     errdefer allocator.free(owned_devices);
     const owned_outcomes = try outcomes.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_outcomes);
+    var access_bindings: std.ArrayList(device_access.LocalBinding) = .empty;
+    const owned_access_bindings = try access_bindings.toOwnedSlice(allocator);
     return .{
         .allocator = allocator,
         .status = .unavailable,
         .devices = owned_devices,
         .probe_outcomes = owned_outcomes,
+        .access_catalog = .{
+            .allocator = allocator,
+            .bindings = owned_access_bindings,
+        },
     };
 }
 
@@ -658,6 +717,42 @@ fn deinitDeviceList(allocator: std.mem.Allocator, devices: *std.ArrayList(Device
 fn deinitOutcomeList(allocator: std.mem.Allocator, outcomes: *std.ArrayList(ProbeOutcome)) void {
     for (outcomes.items) |*outcome| outcome.deinit(allocator);
     outcomes.deinit(allocator);
+}
+
+fn cloneAccessBinding(
+    allocator: std.mem.Allocator,
+    binding: device_access.LocalBinding,
+) !device_access.LocalBinding {
+    const one = try device_access.OwnedCatalog.initClone(allocator, &.{binding});
+    const owned = one.bindings[0];
+    allocator.free(one.bindings);
+    return owned;
+}
+
+fn deinitAccessBinding(
+    allocator: std.mem.Allocator,
+    binding: device_access.LocalBinding,
+) void {
+    allocator.free(binding.device_id);
+    for (binding.cdi_devices) |name| allocator.free(name);
+    allocator.free(binding.cdi_devices);
+    if (binding.host_access) |host| {
+        for (host.device_nodes) |node| allocator.free(node.path);
+        allocator.free(host.device_nodes);
+        for (host.environment) |variable| {
+            allocator.free(variable.name);
+            allocator.free(variable.value);
+        }
+        allocator.free(host.environment);
+    }
+}
+
+fn deinitAccessBindingList(
+    allocator: std.mem.Allocator,
+    bindings: *std.ArrayList(device_access.LocalBinding),
+) void {
+    for (bindings.items) |binding| deinitAccessBinding(allocator, binding);
+    bindings.deinit(allocator);
 }
 
 fn runNvidiaSmi(
@@ -697,8 +792,41 @@ fn runNvidiaSmi(
     if (!succeeded) return error.ProviderCommandFailed;
     const output = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (std.mem.eql(u8, output, "No devices were found")) return .supported;
-    try parseNvidiaSmiCsv(allocator, output, collector);
+    const cdi_output = try queryNvidiaCdiDevices(allocator, io);
+    defer if (cdi_output) |value| allocator.free(value);
+    try parseNvidiaSmiCsvWithCdi(allocator, output, cdi_output, collector);
     return .supported;
+}
+
+/// CDI discovery is intentionally optional for inventory. A missing or broken
+/// local CDI provider leaves the device visible but not executable; it never
+/// causes Nimbus to guess a broad runtime binding.
+fn queryNvidiaCdiDevices(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !?[]u8 {
+    var sanitized_environment = std.process.Environ.Map.init(allocator);
+    defer sanitized_environment.deinit();
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "nvidia-ctk", "cdi", "list" },
+        .stdout_limit = .limited(max_command_output_bytes),
+        .stderr_limit = .limited(max_command_output_bytes),
+        .environ_map = &sanitized_environment,
+        .timeout = .{ .duration = .{ .clock = .boot, .raw = .fromSeconds(3) } },
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer allocator.free(result.stderr);
+    const succeeded = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!succeeded) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
 }
 
 /// Parse the exact six-column CSV emitted by the bounded nvidia-smi provider.
@@ -707,11 +835,24 @@ pub fn parseNvidiaSmiCsv(
     output: []const u8,
     collector: *Collector,
 ) !void {
+    return parseNvidiaSmiCsvWithCdi(allocator, output, null, collector);
+}
+
+fn parseNvidiaSmiCsvWithCdi(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    cdi_output: ?[]const u8,
+    collector: *Collector,
+) !void {
     if (output.len > max_command_output_bytes) return error.ProviderOutputTooLarge;
     const baseline = collector.devices.items.len;
+    const access_baseline = collector.access_bindings.items.len;
     errdefer {
         for (collector.devices.items[baseline..]) |*device| device.deinit(collector.allocator);
         collector.devices.items.len = baseline;
+        for (collector.access_bindings.items[access_baseline..]) |binding|
+            deinitAccessBinding(collector.allocator, binding);
+        collector.access_bindings.items.len = access_baseline;
     }
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |raw_line| {
@@ -737,6 +878,16 @@ pub fn parseNvidiaSmiCsv(
         }
         const opaque_id = try opaqueNvidiaId(allocator, fields[1]);
         defer allocator.free(opaque_id);
+        const cdi_name = try std.fmt.allocPrint(
+            allocator,
+            "nvidia.com/gpu={s}",
+            .{fields[1]},
+        );
+        defer allocator.free(cdi_name);
+        var cdi_names: [1][]const u8 = undefined;
+        const has_exact_cdi = device_access.isValidCdiDevice(cdi_name) and
+            if (cdi_output) |catalog| containsExactLine(catalog, cdi_name) else false;
+        if (has_exact_cdi) cdi_names[0] = cdi_name;
         try collector.add(.{
             .id = opaque_id,
             .kind = .gpu,
@@ -746,8 +897,21 @@ pub fn parseNvidiaSmiCsv(
             .memory_total_bytes = memory_total,
             .driver_version = driver,
             .capabilities = capabilities_buffer[0..capability_count],
+            .local_binding = if (has_exact_cdi) .{
+                .device_id = opaque_id,
+                .cdi_devices = cdi_names[0..1],
+            } else null,
         });
     }
+}
+
+fn containsExactLine(output: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), expected))
+            return true;
+    }
+    return false;
 }
 
 fn parseCsvLine(allocator: std.mem.Allocator, line: []const u8) ![6][]const u8 {
@@ -1129,6 +1293,73 @@ test "nvidia CSV parser handles quoted fields and optional values" {
     try std.testing.expectEqual(@as(?u64, null), collector.devices.items[1].memory_total_bytes);
 }
 
+test "nvidia parser keeps exact CDI binding private" {
+    var collector = Collector.init(std.testing.allocator, 4);
+    defer collector.deinit();
+    const output = "0, GPU-private-uuid, NVIDIA RTX, 16384, 580.65, 12.0\n";
+    const cdi_output =
+        "nvidia.com/gpu=0\n" ++
+        "nvidia.com/gpu=GPU-private-uuid\n" ++
+        "nvidia.com/gpu=all\n";
+    try parseNvidiaSmiCsvWithCdi(
+        std.testing.allocator,
+        output,
+        cdi_output,
+        &collector,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), collector.devices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collector.access_bindings.items.len);
+    try std.testing.expectEqualStrings(
+        collector.devices.items[0].id,
+        collector.access_bindings.items[0].device_id,
+    );
+    try std.testing.expectEqualStrings(
+        "nvidia.com/gpu=GPU-private-uuid",
+        collector.access_bindings.items[0].cdi_devices[0],
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        collector.devices.items[0].id,
+        "GPU-private-uuid",
+    ) == null);
+}
+
+test "inventory report never serializes node-private access binding" {
+    var context: FakeProbeContext = .{ .input = .{
+        .id = "gpu:nvidia:opaque",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "Fixture",
+        .source = "fixture",
+        .local_binding = .{
+            .device_id = "gpu:nvidia:opaque",
+            .cdi_devices = &.{"nvidia.com/gpu=GPU-private-uuid"},
+        },
+    } };
+    const probes = [_]Probe{.{
+        .name = "fixture",
+        .context = &context,
+        .run_fn = runFakeProbe,
+    }};
+    var inventory = try (Registry{ .probes = &probes }).collect(
+        std.testing.allocator,
+        std.testing.io,
+    );
+    defer inventory.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), inventory.accessCatalog().bindings.len);
+    const json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        inventory.report(),
+        .{},
+    );
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "GPU-private-uuid") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "access_catalog") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "local_binding") == null);
+}
+
 test "nvidia CSV parser rejects malformed output without keeping partial device" {
     const malformed = [_][]const u8{
         "0, GPU-a, only-five, 1024, 550.1",
@@ -1146,6 +1377,25 @@ test "nvidia CSV parser rejects malformed output without keeping partial device"
         );
         try std.testing.expectEqual(@as(usize, 0), collector.devices.items.len);
     }
+}
+
+test "nvidia parser rolls back private bindings after a later malformed row" {
+    var collector = Collector.init(std.testing.allocator, 4);
+    defer collector.deinit();
+    const output =
+        "0, GPU-valid, NVIDIA RTX, 16384, 580.65, 12.0\n" ++
+        "not-index, GPU-invalid, NVIDIA RTX, 16384, 580.65, 12.0\n";
+    try std.testing.expectError(
+        error.MalformedProviderOutput,
+        parseNvidiaSmiCsvWithCdi(
+            std.testing.allocator,
+            output,
+            "nvidia.com/gpu=GPU-valid\n",
+            &collector,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), collector.devices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), collector.access_bindings.items.len);
 }
 
 test "wire validation rejects duplicate accelerator identities" {
