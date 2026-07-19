@@ -1,7 +1,7 @@
 const std = @import("std");
 const allocation = @import("allocation.zig");
 
-pub const schema_version: u16 = 2;
+pub const schema_version: u16 = 3;
 pub const max_journal_bytes: usize = 4 * 1024 * 1024;
 pub const max_operations: usize = 4096;
 pub const fingerprint_hex_bytes: usize = 64;
@@ -106,6 +106,14 @@ pub const Operation = struct {
     /// Exact runtime operation identity carried across a control-plane
     /// generation, including a local restart suffix when one is active.
     active_operation_id: ?[]const u8 = null,
+    /// Artifact variant IDs are selected once per generation and carried with
+    /// the runtime they identify. Null denotes a legacy single artifact.
+    active_artifact_variant: ?[]const u8 = null,
+    target_artifact_variant: ?[]const u8 = null,
+    /// Set only when a write-ahead phase proves no runtime could have started.
+    /// It permits a later release to acknowledge an allocation with no handle.
+    runtime_absent_proven: bool = false,
+    failure_code: ?[]const u8 = null,
     /// Access identity for the target runtime of this generation.
     access_fingerprint: []const u8,
     active_handle: ?RuntimeHandle = null,
@@ -301,7 +309,7 @@ pub const Journal = struct {
                 .max_value_len = max_spec_json_bytes,
             },
         ) catch return error.CorruptJournal;
-        if (document.schema_version != schema_version)
+        if (document.schema_version != 2 and document.schema_version != schema_version)
             return error.UnsupportedJournalSchema;
         validateOperations(document.operations) catch return error.CorruptJournal;
         try journal.operations.appendSlice(journal.arena.allocator(), document.operations);
@@ -332,6 +340,16 @@ pub fn validateOperation(operation: Operation) ValidationError!void {
     if (operation.active_operation_id) |operation_id| {
         if (!allocation.isSafeToken(operation_id)) return error.InvalidOperationId;
     }
+    if (operation.active_artifact_variant) |variant| {
+        if (!allocation.isSafeToken(variant)) return error.InvalidSpec;
+    }
+    if (operation.target_artifact_variant) |variant| {
+        if (!allocation.isSafeToken(variant)) return error.InvalidSpec;
+    }
+    if (operation.failure_code) |code| {
+        if (code.len == 0 or code.len > allocation.max_message_bytes)
+            return error.InvalidSpec;
+    }
     if (!isFingerprint(operation.access_fingerprint))
         return error.InvalidAccessFingerprint;
     if (operation.active_handle) |handle| try handle.validate();
@@ -354,13 +372,15 @@ pub fn validateOperation(operation: Operation) ValidationError!void {
                 operation.entry.phase != .released_ack_pending or
                 operation.control_plane_ack_unix_ms != null)
                 return error.InvalidDisposition;
-            if (operation.active_handle == null) return error.MissingRuntimeHandle;
+            if (operation.active_handle == null and !operation.runtime_absent_proven)
+                return error.MissingRuntimeHandle;
         },
         .released_tombstone => {
             if (operation.entry.action != .release or
                 operation.entry.phase != .released)
                 return error.InvalidDisposition;
-            if (operation.active_handle == null) return error.MissingRuntimeHandle;
+            if (operation.active_handle == null and !operation.runtime_absent_proven)
+                return error.MissingRuntimeHandle;
             const acknowledged = operation.control_plane_ack_unix_ms orelse
                 return error.InvalidAcknowledgementTimestamp;
             if (acknowledged <= 0 or acknowledged > operation.recorded_unix_ms)
@@ -435,6 +455,17 @@ fn validateReplacement(previous: Operation, next: Operation) PutError!void {
         next.active_access_fingerprint,
     );
     try immutableOptionalString(previous.active_operation_id, next.active_operation_id);
+    try immutableOptionalString(
+        previous.active_artifact_variant,
+        next.active_artifact_variant,
+    );
+    try immutableOptionalString(
+        previous.target_artifact_variant,
+        next.target_artifact_variant,
+    );
+    if (previous.runtime_absent_proven and !next.runtime_absent_proven)
+        return error.RuntimeHandleChanged;
+    try immutableOptionalString(previous.failure_code, next.failure_code);
     if (previous.entry.action != next.entry.action or
         previous.command_revision != next.command_revision or
         previous.entry.target_revision != next.entry.target_revision or
@@ -508,6 +539,16 @@ fn cloneOperation(allocator_: std.mem.Allocator, source: Operation) !Operation {
             allocator_,
             source.active_operation_id,
         ),
+        .active_artifact_variant = try cloneOptionalString(
+            allocator_,
+            source.active_artifact_variant,
+        ),
+        .target_artifact_variant = try cloneOptionalString(
+            allocator_,
+            source.target_artifact_variant,
+        ),
+        .runtime_absent_proven = source.runtime_absent_proven,
+        .failure_code = try cloneOptionalString(allocator_, source.failure_code),
         .access_fingerprint = try allocator_.dupe(u8, source.access_fingerprint),
         .active_handle = if (source.active_handle) |handle|
             try cloneHandle(allocator_, handle)

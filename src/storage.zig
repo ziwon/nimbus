@@ -906,6 +906,10 @@ pub const Registry = struct {
             node_report.value.features,
             heartbeat.feature_accelerator_lifecycle_v1,
         );
+        const supports_artifact_variants = hasFeature(
+            node_report.value.features,
+            heartbeat.feature_artifact_variants_v1,
+        );
 
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -991,20 +995,45 @@ pub const Registry = struct {
                 .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
             );
             defer parsed_spec.deinit();
+            var parsed_fallback: ?std.json.Parsed(orchestration.Deployment) = null;
+            defer if (parsed_fallback) |*parsed| parsed.deinit();
+            var effective_spec = parsed_spec.value;
 
-            if (parsed_spec.value.resources) |resources| {
-                if (parsed_spec.value.desired == .stopped) {
+            if (parsed_spec.value.artifact_variants != null and
+                !supports_artifact_variants)
+            {
+                try self.recordPlacementDecision(
+                    parsed_spec.value,
+                    node_id,
+                    false,
+                    "artifact_variant_feature_unsupported",
+                    now_unix_ms,
+                );
+                const fallback = previous_spec orelse continue;
+                parsed_fallback = try std.json.parseFromSlice(
+                    orchestration.Deployment,
+                    self.allocator,
+                    fallback,
+                    .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+                );
+                if (parsed_fallback.?.value.artifact_variants != null) continue;
+                emitted_spec = fallback;
+                effective_spec = parsed_fallback.?.value;
+            }
+
+            if (effective_spec.resources) |resources| {
+                if (effective_spec.desired == .stopped) {
                     if (supports_accelerator_lifecycle)
                         try self.ensureLifecycleRelease(
-                            parsed_spec.value.name,
+                            effective_spec.name,
                             node_id,
                             now_unix_ms,
                         );
-                    try self.releasePlacement(parsed_spec.value.name, node_id);
+                    try self.releasePlacement(effective_spec.name, node_id);
                 } else {
                     if (!supports_accelerator_requirements) {
                         try self.recordPlacementDecision(
-                            parsed_spec.value,
+                            effective_spec,
                             node_id,
                             false,
                             "agent_feature_unsupported",
@@ -1016,13 +1045,13 @@ pub const Registry = struct {
                     } else if (supports_accelerator_lifecycle) {
                         var placement = try self.syncLifecycleAllocation(
                             node_report.value,
-                            parsed_spec.value,
+                            effective_spec,
                             resources.accelerators,
                             now_unix_ms,
                         );
                         defer placement.deinit();
                         try self.recordPlacementDecision(
-                            parsed_spec.value,
+                            effective_spec,
                             node_id,
                             placement.ready,
                             placement.reason_code,
@@ -1031,13 +1060,13 @@ pub const Registry = struct {
                     } else {
                         var placement = try self.placeAccelerators(
                             node_report.value,
-                            parsed_spec.value,
+                            effective_spec,
                             resources.accelerators,
                             now_unix_ms,
                         );
                         defer placement.deinit();
                         try self.recordPlacementDecision(
-                            parsed_spec.value,
+                            effective_spec,
                             node_id,
                             placement.ready,
                             placement.reason_code,
@@ -1045,8 +1074,8 @@ pub const Registry = struct {
                         );
                         if (placement.ready) {
                             const assignment: orchestration.AcceleratorAssignment = .{
-                                .deployment = parsed_spec.value.name,
-                                .revision = parsed_spec.value.revision,
+                                .deployment = effective_spec.name,
+                                .revision = effective_spec.revision,
                                 .device_ids = placement.ids.items,
                             };
                             const assignment_json = try std.json.Stringify.valueAlloc(
@@ -1064,11 +1093,11 @@ pub const Registry = struct {
             } else {
                 if (supports_accelerator_lifecycle)
                     try self.ensureLifecycleRelease(
-                        parsed_spec.value.name,
+                        effective_spec.name,
                         node_id,
                         now_unix_ms,
                     );
-                try self.releasePlacement(parsed_spec.value.name, node_id);
+                try self.releasePlacement(effective_spec.name, node_id);
             }
             if (!first) try output.append(self.allocator, ',');
             first = false;
@@ -1106,9 +1135,32 @@ pub const Registry = struct {
                 "assigned_device_unconfirmed");
 
         if (existing) |*command| {
-            if ((command.phase == .failed or command.phase == .ambiguous) and
-                command.phase != .released)
+            if (command.phase == .ambiguous)
                 return self.blockedPlacement("allocation_recovery_required");
+            if (command.phase == .failed) {
+                if (command.action != .run or command.revision == deployment.revision)
+                    return self.blockedPlacement("allocation_recovery_required");
+                if (inventory.status != .complete)
+                    return self.blockedPlacement("assigned_device_unconfirmed");
+                if (reservationMatches(inventory, requirement, command.ids.items)) {
+                    try self.writeLifecycleRun(
+                        report.node_id,
+                        deployment.name,
+                        command.allocation_id,
+                        try nextAllocationGeneration(command.generation),
+                        deployment.revision,
+                        command.ids.items,
+                        now_unix_ms,
+                    );
+                    return .{
+                        .ids = try cloneIds(self.allocator, command.ids.items),
+                        .ready = true,
+                        .reason_code = "",
+                    };
+                }
+                try self.markLifecycleRelease(command.*, now_unix_ms);
+                return self.blockedPlacement("accelerator_release_in_progress");
+            }
             if (command.action == .release and command.phase != .released)
                 return self.blockedPlacement("accelerator_release_in_progress");
             if (command.action == .run and command.phase != .released) {
@@ -2671,6 +2723,61 @@ test "SQLite registry persists and marks nodes stale" {
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"status\":\"stale\"") != null);
 }
 
+test "artifact variants are delivered only to agents that advertise support" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const legacy_features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    try recordLifecycleTestHeartbeat(&registry, lifecycleTestHeartbeat(&legacy_features), 1000);
+    const variants = [_]orchestration.ArtifactVariant{.{
+        .name = "linux-x86",
+        .artifact = .{
+            .source = "file:///tmp/model",
+            .sha256 = "ab" ** 32,
+        },
+        .selector = .{ .os = "linux", .arch = "x86_64" },
+    }};
+    const deployment: orchestration.Deployment = .{
+        .name = "variant-model",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"{artifact}"} },
+        .artifact_variants = &variants,
+        .targets = .{ .all = true },
+    };
+    try applyLifecycleTestDeployment(&registry, deployment, 1100);
+
+    const unsupported = (try registry.desiredStateForNode("gpu-edge", 1200)).?;
+    defer std.testing.allocator.free(unsupported);
+    var parsed_unsupported = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        unsupported,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed_unsupported.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed_unsupported.value.deployments.len);
+
+    const supported_features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+        heartbeat.feature_artifact_variants_v1,
+    };
+    try recordLifecycleTestHeartbeat(&registry, lifecycleTestHeartbeat(&supported_features), 1300);
+    const supported = (try registry.desiredStateForNode("gpu-edge", 1400)).?;
+    defer std.testing.allocator.free(supported);
+    var parsed_supported = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        supported,
+        .{ .ignore_unknown_fields = false },
+    );
+    defer parsed_supported.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_supported.value.deployments.len);
+    try std.testing.expect(parsed_supported.value.deployments[0].artifact_variants != null);
+}
+
 test "version one and accelerator inventory heartbeats coexist" {
     var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
     defer registry.close();
@@ -3183,6 +3290,71 @@ test "lifecycle claims fence legacy placement and feature regression" {
     defer legacy_reservations.finalize();
     try std.testing.expect(try legacy_reservations.row());
     try std.testing.expectEqual(@as(i64, 0), legacy_reservations.columnInt64(0));
+}
+
+test "failed accelerator generation can reconcile a newer rollback revision" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    try recordLifecycleTestHeartbeat(&registry, lifecycleTestHeartbeat(&features), 1000);
+    var deployment = lifecycleTestDeployment("vision-recovery");
+    try applyLifecycleTestDeployment(&registry, deployment, 1100);
+
+    const first_json = (try registry.desiredStateForNode("gpu-edge", 1200)).?;
+    defer std.testing.allocator.free(first_json);
+    var first = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        first_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer first.deinit();
+    const first_command = first.value.accelerator_allocations[0];
+    const allocation_id = try std.testing.allocator.dupe(u8, first_command.allocation_id);
+    defer std.testing.allocator.free(allocation_id);
+    var allocation_status: allocation.Status = .{
+        .allocation_id = allocation_id,
+        .generation = 1,
+        .node_id = "gpu-edge",
+        .deployment = "vision-recovery",
+        .revision = 1,
+        .phase = .pending,
+        .observed_unix_ms = 1210,
+    };
+    const failure_phases = [_]allocation.ObservedPhase{
+        allocation.ObservedPhase.pending,
+        allocation.ObservedPhase.prepared,
+        allocation.ObservedPhase.failed,
+    };
+    for (&failure_phases, 0..) |phase, index| {
+        allocation_status.phase = phase;
+        allocation_status.observed_unix_ms = 1210 + @as(i64, @intCast(index));
+        try std.testing.expect(try registry.recordAllocationStatus(
+            allocation_status,
+            allocation_status.observed_unix_ms,
+        ));
+    }
+
+    deployment.revision = 2;
+    try applyLifecycleTestDeployment(&registry, deployment, 1300);
+    const recovery_json = (try registry.desiredStateForNode("gpu-edge", 1400)).?;
+    defer std.testing.allocator.free(recovery_json);
+    var recovery = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        recovery_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovery.value.accelerator_allocations.len);
+    const command = recovery.value.accelerator_allocations[0];
+    try std.testing.expectEqual(allocation.DesiredAction.run, command.action);
+    try std.testing.expectEqual(@as(u64, 2), command.generation);
+    try std.testing.expectEqual(@as(u64, 2), command.revision);
+    try std.testing.expectEqualStrings(allocation_id, command.allocation_id);
 }
 
 test "delete and recreate cannot cancel a fenced release" {

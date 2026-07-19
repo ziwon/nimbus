@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const accelerator = @import("accelerator.zig");
 const accelerator_reconciler = @import("accelerator_reconciler.zig");
 const accelerator_runtime = @import("accelerator_runtime.zig");
 const agent_journal = @import("agent_journal.zig");
 const allocation = @import("allocation.zig");
+const artifact_selector = @import("artifact_selector.zig");
 const client = @import("client.zig");
 const device_access = @import("device_access.zig");
 const orchestration = @import("orchestration.zig");
@@ -31,6 +33,7 @@ const Context = struct {
     status_url: []const u8,
     journal_path: []const u8,
     runtime_options: runtime.Options,
+    inventory: *const accelerator.Inventory,
 };
 
 /// Apply all fenced accelerator commands in a desired-state snapshot. Releases
@@ -71,6 +74,7 @@ pub fn reconcileDesired(
         .status_url = status_url,
         .journal_path = journal_path,
         .runtime_options = options.runtime_options,
+        .inventory = options.inventory,
     };
     const hooks = productionHooks(&context);
 
@@ -146,12 +150,52 @@ fn productionHooks(context: *Context) accelerator_reconciler.Hooks {
         .now_fn = now,
         .persist_fn = persist,
         .report_fn = report,
+        .select_artifact_fn = selectArtifact,
+        .preflight_fn = preflight,
         .inspect_fn = inspect,
         .start_fn = start,
         .stop_fn = stop,
         .healthy_fn = healthy,
         .deinit_handle_fn = deinitHandle,
     };
+}
+
+fn selectArtifact(
+    raw_context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    deployment: orchestration.Deployment,
+    plan: device_access.Plan,
+) !?[]u8 {
+    const context = contextFromOpaque(raw_context);
+    var selected: [accelerator.max_device_count]accelerator.Device = undefined;
+    try selectedDevices(context, plan, &selected);
+    const selection = (try artifact_selector.select(deployment, .{
+        .os = @tagName(builtin.target.os.tag),
+        .arch = @tagName(builtin.target.cpu.arch),
+        .abi = @tagName(builtin.target.abi),
+        .accelerators = selected[0..plan.device_ids.len],
+    })) orelse return null;
+    const name = selection.variant_name orelse return null;
+    return @as(?[]u8, try allocator.dupe(u8, name));
+}
+
+fn preflight(
+    raw_context: ?*anyopaque,
+    deployment: orchestration.Deployment,
+    plan: device_access.Plan,
+    variant_name: ?[]const u8,
+) !void {
+    const context = contextFromOpaque(raw_context);
+    var selected: [accelerator.max_device_count]accelerator.Device = undefined;
+    try selectedDevices(context, plan, &selected);
+    const artifact_path = try runtime.preflightArtifactVariantFor(
+        context.init,
+        deployment,
+        context.runtime_options,
+        selected[0..plan.device_ids.len],
+        variant_name,
+    );
+    if (artifact_path) |path| context.init.gpa.free(path);
 }
 
 fn contextFromOpaque(raw_context: ?*anyopaque) *Context {
@@ -229,12 +273,17 @@ fn start(
     deployment: orchestration.Deployment,
     plan: device_access.Plan,
     identity: accelerator_reconciler.RuntimeIdentity,
+    variant_name: ?[]const u8,
 ) !agent_journal.RuntimeHandle {
     const context = contextFromOpaque(raw_context);
-    const artifact_path = try runtime.prepareArtifact(
+    var selected: [accelerator.max_device_count]accelerator.Device = undefined;
+    try selectedDevices(context, plan, &selected);
+    const artifact_path = try runtime.prepareArtifactVariantFor(
         context.init,
         deployment,
         context.runtime_options,
+        selected[0..plan.device_ids.len],
+        variant_name,
     );
     defer if (artifact_path) |path| context.init.gpa.free(path);
     return accelerator_runtime.start(
@@ -246,6 +295,27 @@ fn start(
     );
 }
 
+fn selectedDevices(
+    context: *Context,
+    plan: device_access.Plan,
+    output: *[accelerator.max_device_count]accelerator.Device,
+) !void {
+    for (plan.device_ids, 0..) |device_id, index| {
+        output[index] = findDevice(context.inventory.report(), device_id) orelse
+            return error.AssignedAcceleratorMissing;
+    }
+}
+
+fn findDevice(
+    inventory: accelerator.InventoryReport,
+    device_id: []const u8,
+) ?accelerator.Device {
+    for (inventory.accelerators) |device| {
+        if (std.mem.eql(u8, device.id, device_id)) return device;
+    }
+    return null;
+}
+
 fn stop(
     raw_context: ?*anyopaque,
     identity: accelerator_reconciler.RuntimeIdentity,
@@ -253,6 +323,11 @@ fn stop(
 ) !void {
     const context = contextFromOpaque(raw_context);
     try accelerator_runtime.stop(context.init, runtimeIdentity(identity), handle);
+    try runtime.releaseArtifactPin(
+        context.init,
+        context.runtime_options,
+        identity.deployment,
+    );
 }
 
 fn healthy(

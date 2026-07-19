@@ -33,6 +33,18 @@ pub const Hooks = struct {
     now_fn: *const fn (?*anyopaque) anyerror!i64,
     persist_fn: *const fn (?*anyopaque, *const agent_journal.Journal) anyerror!void,
     report_fn: *const fn (?*anyopaque, allocation.Status) anyerror!ReportResult,
+    select_artifact_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        orchestration.Deployment,
+        device_access.Plan,
+    ) anyerror!?[]u8,
+    preflight_fn: *const fn (
+        ?*anyopaque,
+        orchestration.Deployment,
+        device_access.Plan,
+        ?[]const u8,
+    ) anyerror!void,
     inspect_fn: *const fn (
         ?*anyopaque,
         orchestration.Deployment,
@@ -43,6 +55,7 @@ pub const Hooks = struct {
         orchestration.Deployment,
         device_access.Plan,
         RuntimeIdentity,
+        ?[]const u8,
     ) anyerror!agent_journal.RuntimeHandle,
     stop_fn: *const fn (
         ?*anyopaque,
@@ -105,12 +118,32 @@ pub fn reconcileCommand(
         const report_result = try reportCurrent(node_id, current.*, hooks);
         switch (current.entry.phase) {
             .pending => try transition(journal, current.*, .prepared, hooks),
-            .prepared => try transition(
-                journal,
-                current.*,
-                if (current.active_handle != null) .stopping_old else .starting_target,
-                hooks,
-            ),
+            .prepared => {
+                const spec = current.target_spec_json orelse return error.InvalidPersistedSpec;
+                var parsed = try parseDeployment(allocator, spec);
+                defer parsed.deinit();
+                const plan = access_plan orelse return error.MissingRunAccessPlan;
+                hooks.preflight_fn(
+                    hooks.context,
+                    parsed.value,
+                    plan,
+                    current.target_artifact_variant,
+                ) catch |err| {
+                    var failed = current.*;
+                    failed.entry.phase = .failed;
+                    failed.runtime_absent_proven = current.active_handle == null;
+                    failed.failure_code = @errorName(err);
+                    failed.recorded_unix_ms = try hooks.now_fn(hooks.context);
+                    try putAndPersist(journal, failed, hooks);
+                    continue;
+                };
+                try transition(
+                    journal,
+                    current.*,
+                    if (current.active_handle != null) .stopping_old else .starting_target,
+                    hooks,
+                );
+            },
             .stopping_old => {
                 const handle = current.active_handle orelse return error.MissingActiveRuntime;
                 const identity = try activeIdentityAlloc(allocator, current.*);
@@ -142,6 +175,7 @@ pub fn reconcileCommand(
                         parsed.value,
                         plan,
                         identity,
+                        current.target_artifact_variant,
                     ),
                     .owned => |owned| owned,
                     .conflict => return markAmbiguous(
@@ -265,6 +299,7 @@ pub fn reconcileCommand(
                             parsed.value,
                             plan,
                             identity,
+                            current.active_artifact_variant,
                         ),
                         .owned => |owned| owned,
                         .conflict => return markAmbiguous(
@@ -284,17 +319,19 @@ pub fn reconcileCommand(
             },
             .release_requested => try transition(journal, current.*, .stopping, hooks),
             .stopping => {
-                const handle = current.active_handle orelse return error.MissingActiveRuntime;
-                const identity = try activeIdentityAlloc(allocator, current.*);
-                defer allocator.free(identity.operation_id);
-                try stopExactOrAmbiguous(
-                    journal,
-                    node_id,
-                    current.*,
-                    identity,
-                    handle,
-                    hooks,
-                );
+                if (!current.runtime_absent_proven) {
+                    const handle = current.active_handle orelse return error.MissingActiveRuntime;
+                    const identity = try activeIdentityAlloc(allocator, current.*);
+                    defer allocator.free(identity.operation_id);
+                    try stopExactOrAmbiguous(
+                        journal,
+                        node_id,
+                        current.*,
+                        identity,
+                        handle,
+                        hooks,
+                    );
+                }
                 var next = current.*;
                 next.entry.phase = .released_ack_pending;
                 next.entry.active_revision = null;
@@ -361,6 +398,13 @@ fn ensureOperation(
         const target_spec = try std.json.Stringify.valueAlloc(allocator, target, .{});
         defer allocator.free(target_spec);
         const access_hex = std.fmt.bytesToHex(plan.fingerprint, .lower);
+        const target_variant = try hooks.select_artifact_fn(
+            hooks.context,
+            allocator,
+            target,
+            plan,
+        );
+        defer if (target_variant) |value| allocator.free(value);
 
         var active_revision: ?u64 = null;
         var active_ids: []const []const u8 = &.{};
@@ -368,6 +412,7 @@ fn ensureOperation(
         var active_spec: ?[]const u8 = null;
         var active_access: ?[]const u8 = null;
         var active_operation_id: ?[]u8 = null;
+        var active_artifact_variant: ?[]const u8 = null;
         defer if (active_operation_id) |value| allocator.free(value);
         if (existing) |previous| {
             active_revision = actualActiveRevision(previous.*);
@@ -376,6 +421,7 @@ fn ensureOperation(
             active_spec = actualActiveSpec(previous.*);
             active_access = actualActiveAccess(previous.*);
             active_operation_id = try actualActiveOperationIdAlloc(allocator, previous.*);
+            active_artifact_variant = actualActiveArtifactVariant(previous.*);
         }
 
         const operation: agent_journal.Operation = .{
@@ -395,6 +441,8 @@ fn ensureOperation(
             .desired_fingerprint = desired_fingerprint,
             .active_access_fingerprint = active_access,
             .active_operation_id = active_operation_id,
+            .active_artifact_variant = active_artifact_variant,
+            .target_artifact_variant = target_variant,
             .access_fingerprint = &access_hex,
             .active_handle = active_handle,
             .active_spec_json = active_spec,
@@ -405,17 +453,25 @@ fn ensureOperation(
         return;
     } else {
         const previous = existing orelse return error.MissingReleaseJournal;
-        const active_handle = actualActiveHandle(previous.*) orelse
+        const active_handle = actualActiveHandle(previous.*);
+        if (active_handle == null and !previous.runtime_absent_proven)
             return error.MissingActiveRuntime;
         const active_access = actualActiveAccess(previous.*) orelse
-            return error.MissingActiveAccessFingerprint;
+            if (previous.runtime_absent_proven)
+                previous.access_fingerprint
+            else
+                return error.MissingActiveAccessFingerprint;
         const active_spec = actualActiveSpec(previous.*) orelse
-            return error.MissingActiveSpec;
-        const active_operation_id = (try actualActiveOperationIdAlloc(
+            if (previous.runtime_absent_proven)
+                previous.target_spec_json orelse return error.MissingActiveSpec
+            else
+                return error.MissingActiveSpec;
+        const active_operation_id = try actualActiveOperationIdAlloc(
             allocator,
             previous.*,
-        )) orelse return error.MissingActiveRuntime;
-        defer allocator.free(active_operation_id);
+        );
+        defer if (active_operation_id) |value| allocator.free(value);
+        const active_artifact_variant = actualActiveArtifactVariant(previous.*);
         const operation: agent_journal.Operation = .{
             .entry = .{
                 .allocation_id = command.allocation_id,
@@ -432,9 +488,11 @@ fn ensureOperation(
             .desired_fingerprint = desired_fingerprint,
             .active_access_fingerprint = active_access,
             .active_operation_id = active_operation_id,
+            .active_artifact_variant = active_artifact_variant,
             .access_fingerprint = active_access,
             .active_handle = active_handle,
             .active_spec_json = active_spec,
+            .runtime_absent_proven = previous.runtime_absent_proven,
             .recorded_unix_ms = now,
         };
         try putAndPersist(journal, operation, hooks);
@@ -475,6 +533,7 @@ fn reportCurrent(
         .deployment = operation.entry.deployment,
         .revision = operation.command_revision,
         .phase = operation.entry.phase,
+        .message = operation.failure_code orelse "",
         .observed_unix_ms = try hooks.now_fn(hooks.context),
     });
 }
@@ -546,6 +605,7 @@ fn restartActive(
             deployment,
             access_plan,
             next_identity,
+            current.target_artifact_variant,
         ),
         .owned => |owned| owned,
         .conflict => return markAmbiguous(journal, node_id, current, hooks),
@@ -679,6 +739,16 @@ fn actualActiveSpec(operation: agent_journal.Operation) ?[]const u8 {
         operation.target_spec_json orelse operation.active_spec_json;
 }
 
+fn actualActiveArtifactVariant(operation: agent_journal.Operation) ?[]const u8 {
+    if (actualActiveHandle(operation) == null) return null;
+    return if (operation.restored_handle != null)
+        operation.active_artifact_variant
+    else if (operation.target_handle != null or operation.restart_handle != null)
+        operation.target_artifact_variant
+    else
+        operation.active_artifact_variant;
+}
+
 fn actualActiveAccess(operation: agent_journal.Operation) ?[]const u8 {
     if (actualActiveHandle(operation) == null) return null;
     return if (operation.restored_handle != null or operation.target_handle != null)
@@ -759,6 +829,10 @@ const FakeContext = struct {
     recover_on_restart: bool = false,
     fail_persist: bool = false,
     fail_report_phase: ?allocation.ObservedPhase = null,
+    fail_preflight: bool = false,
+    selected_artifact_variant: ?[]const u8 = null,
+    last_start_artifact_variant: [128]u8 = undefined,
+    last_start_artifact_variant_len: usize = 0,
     conflict: bool = false,
     running: ?agent_journal.RuntimeHandle = null,
     last_stop_operation: [allocation.max_token_bytes]u8 = undefined,
@@ -773,12 +847,34 @@ fn fakeHooks(context: *FakeContext) Hooks {
         .now_fn = fakeNow,
         .persist_fn = fakePersist,
         .report_fn = fakeReport,
+        .select_artifact_fn = fakeSelectArtifact,
+        .preflight_fn = fakePreflight,
         .inspect_fn = fakeInspect,
         .start_fn = fakeStart,
         .stop_fn = fakeStop,
         .healthy_fn = fakeHealthy,
         .deinit_handle_fn = fakeDeinitHandle,
     };
+}
+
+fn fakePreflight(
+    pointer: ?*anyopaque,
+    _: orchestration.Deployment,
+    _: device_access.Plan,
+    _: ?[]const u8,
+) !void {
+    if (fakeContext(pointer).fail_preflight)
+        return error.InjectedArtifactPreflightFailure;
+}
+
+fn fakeSelectArtifact(
+    pointer: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: orchestration.Deployment,
+    _: device_access.Plan,
+) !?[]u8 {
+    const name = fakeContext(pointer).selected_artifact_variant orelse return null;
+    return @as(?[]u8, try allocator.dupe(u8, name));
 }
 
 fn fakeContext(pointer: ?*anyopaque) *FakeContext {
@@ -821,8 +917,13 @@ fn fakeStart(
     _: orchestration.Deployment,
     _: device_access.Plan,
     _: RuntimeIdentity,
+    variant_name: ?[]const u8,
 ) !agent_journal.RuntimeHandle {
     const context = fakeContext(pointer);
+    if (variant_name) |name| {
+        @memcpy(context.last_start_artifact_variant[0..name.len], name);
+        context.last_start_artifact_variant_len = name.len;
+    }
     context.start_count += 1;
     const full_id = switch (context.start_count) {
         1 => "ab" ** 32,
@@ -943,6 +1044,48 @@ test "write-ahead run adopts after a crash and never duplicates start" {
     try std.testing.expectEqual(
         allocation.ObservedPhase.active,
         journal.find("alloc-vision").?.entry.phase,
+    );
+}
+
+test "artifact variant choice is journaled before start and reused after crash" {
+    var journal = agent_journal.Journal.init(std.testing.allocator);
+    defer journal.deinit();
+    var context: FakeContext = .{
+        .fail_report_phase = .starting_target,
+        .selected_artifact_variant = "gpu-primary",
+    };
+
+    try std.testing.expectError(
+        error.InjectedReportFailure,
+        reconcileCommand(
+            std.testing.allocator,
+            &journal,
+            "gpu-edge",
+            test_run,
+            test_deployment,
+            test_plan,
+            fakeHooks(&context),
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "gpu-primary",
+        journal.find("alloc-vision").?.target_artifact_variant.?,
+    );
+
+    context.selected_artifact_variant = "changed-after-crash";
+    context.fail_report_phase = null;
+    try reconcileCommand(
+        std.testing.allocator,
+        &journal,
+        "gpu-edge",
+        test_run,
+        test_deployment,
+        test_plan,
+        fakeHooks(&context),
+    );
+    try std.testing.expectEqualStrings(
+        "gpu-primary",
+        context.last_start_artifact_variant[0..context.last_start_artifact_variant_len],
     );
 }
 
@@ -1069,6 +1212,88 @@ test "persist failure occurs before any runtime effect" {
     );
     try std.testing.expectEqual(@as(usize, 0), context.inspect_count);
     try std.testing.expectEqual(@as(usize, 0), context.start_count);
+    try std.testing.expectEqual(@as(usize, 0), context.stop_count);
+}
+
+test "artifact preflight failure preserves the active runtime and reports failed" {
+    var journal = agent_journal.Journal.init(std.testing.allocator);
+    defer journal.deinit();
+    var context: FakeContext = .{};
+    try reconcileCommand(
+        std.testing.allocator,
+        &journal,
+        "gpu-edge",
+        test_run,
+        test_deployment,
+        test_plan,
+        fakeHooks(&context),
+    );
+    const active = context.running.?;
+
+    var deployment_v2 = test_deployment;
+    deployment_v2.revision = 2;
+    var run_v2 = test_run;
+    run_v2.generation = 2;
+    run_v2.revision = 2;
+    context.fail_preflight = true;
+    try reconcileCommand(
+        std.testing.allocator,
+        &journal,
+        "gpu-edge",
+        run_v2,
+        deployment_v2,
+        test_plan,
+        fakeHooks(&context),
+    );
+    try std.testing.expectEqual(
+        allocation.ObservedPhase.failed,
+        journal.find("alloc-vision").?.entry.phase,
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.start_count);
+    try std.testing.expectEqual(@as(usize, 0), context.stop_count);
+    try std.testing.expect(agent_journal.RuntimeHandle.eql(active, context.running.?));
+}
+
+test "first deployment preflight failure can release without a runtime handle" {
+    var journal = agent_journal.Journal.init(std.testing.allocator);
+    defer journal.deinit();
+    var context: FakeContext = .{ .fail_preflight = true };
+    try reconcileCommand(
+        std.testing.allocator,
+        &journal,
+        "gpu-edge",
+        test_run,
+        test_deployment,
+        test_plan,
+        fakeHooks(&context),
+    );
+    const failed = journal.find("alloc-vision").?;
+    try std.testing.expectEqual(allocation.ObservedPhase.failed, failed.entry.phase);
+    try std.testing.expect(failed.runtime_absent_proven);
+    try std.testing.expect(failed.active_handle == null);
+
+    const release: allocation.DesiredAllocation = .{
+        .allocation_id = "alloc-vision",
+        .generation = 2,
+        .deployment = "vision",
+        .revision = 1,
+        .action = .release,
+        .retiring_device_ids = &.{"gpu:nvidia:a"},
+    };
+    context.fail_preflight = false;
+    try reconcileCommand(
+        std.testing.allocator,
+        &journal,
+        "gpu-edge",
+        release,
+        null,
+        null,
+        fakeHooks(&context),
+    );
+    try std.testing.expectEqual(
+        allocation.ObservedPhase.released,
+        journal.find("alloc-vision").?.entry.phase,
+    );
     try std.testing.expectEqual(@as(usize, 0), context.stop_count);
 }
 
