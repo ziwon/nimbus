@@ -1,5 +1,6 @@
 const std = @import("std");
 const accelerator = @import("accelerator.zig");
+const allocation = @import("allocation.zig");
 
 pub const schema_version: u8 = 1;
 
@@ -116,6 +117,7 @@ pub const DesiredState = struct {
     generation: i64,
     deployments: []const Deployment,
     accelerator_assignments: []const AcceleratorAssignment = &.{},
+    accelerator_allocations: []const allocation.DesiredAllocation = &.{},
 };
 
 pub const StatusReport = struct {

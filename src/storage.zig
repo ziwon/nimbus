@@ -1,5 +1,6 @@
 const std = @import("std");
 const accelerator = @import("accelerator.zig");
+const allocation = @import("allocation.zig");
 const heartbeat = @import("heartbeat.zig");
 const orchestration = @import("orchestration.zig");
 const c = @cImport({
@@ -128,7 +129,7 @@ pub const Registry = struct {
             \\  applied_unix_ms INTEGER NOT NULL
             \\);
             \\INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-            \\  VALUES (1, 0), (2, 0), (3, 0);
+            \\  VALUES (1, 0), (2, 0), (3, 0), (4, 0);
             \\CREATE TABLE IF NOT EXISTS deployments (
             \\  name TEXT PRIMARY KEY,
             \\  revision INTEGER NOT NULL,
@@ -181,6 +182,64 @@ pub const Registry = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS accelerator_reservations_owner
             \\  ON accelerator_reservations(deployment_name, node_id, revision);
+            \\CREATE TABLE IF NOT EXISTS accelerator_allocation_commands (
+            \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE RESTRICT,
+            \\  deployment_name TEXT NOT NULL,
+            \\  allocation_id TEXT NOT NULL UNIQUE,
+            \\  generation INTEGER NOT NULL,
+            \\  revision INTEGER NOT NULL,
+            \\  action TEXT NOT NULL,
+            \\  phase TEXT NOT NULL,
+            \\  created_unix_ms INTEGER NOT NULL,
+            \\  updated_unix_ms INTEGER NOT NULL,
+            \\  PRIMARY KEY (node_id, deployment_name),
+            \\  UNIQUE (allocation_id, generation),
+            \\  CHECK (generation > 0),
+            \\  CHECK (revision > 0),
+            \\  CHECK (action IN ('run', 'release')),
+            \\  CHECK (phase IN (
+            \\    'pending', 'prepared', 'stopping_old', 'old_stopped',
+            \\    'starting_target', 'target_started', 'verifying', 'active',
+            \\    'stopping_target', 'target_stopped', 'restoring_old',
+            \\    'release_requested', 'stopping', 'released_ack_pending',
+            \\    'released', 'ambiguous', 'failed'
+            \\  ))
+            \\);
+            \\CREATE TABLE IF NOT EXISTS accelerator_allocation_claims (
+            \\  node_id TEXT NOT NULL,
+            \\  accelerator_id TEXT NOT NULL,
+            \\  allocation_id TEXT NOT NULL,
+            \\  deployment_name TEXT NOT NULL,
+            \\  generation INTEGER NOT NULL,
+            \\  revision INTEGER NOT NULL,
+            \\  role TEXT NOT NULL,
+            \\  updated_unix_ms INTEGER NOT NULL,
+            \\  PRIMARY KEY (node_id, accelerator_id),
+            \\  CHECK (generation > 0),
+            \\  CHECK (revision > 0),
+            \\  CHECK (role IN ('active', 'candidate', 'retiring', 'ambiguous')),
+            \\  FOREIGN KEY (allocation_id, generation)
+            \\    REFERENCES accelerator_allocation_commands(allocation_id, generation)
+            \\    ON UPDATE CASCADE ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+            \\);
+            \\CREATE INDEX IF NOT EXISTS accelerator_allocation_claims_owner
+            \\  ON accelerator_allocation_claims(allocation_id, role, accelerator_id);
+            \\CREATE TABLE IF NOT EXISTS accelerator_allocation_status_history (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  allocation_id TEXT NOT NULL,
+            \\  generation INTEGER NOT NULL,
+            \\  node_id TEXT NOT NULL,
+            \\  deployment_name TEXT NOT NULL,
+            \\  revision INTEGER NOT NULL,
+            \\  phase TEXT NOT NULL,
+            \\  message TEXT NOT NULL,
+            \\  observed_unix_ms INTEGER NOT NULL,
+            \\  received_unix_ms INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS accelerator_allocation_status_lookup
+            \\  ON accelerator_allocation_status_history(
+            \\    allocation_id, generation, received_unix_ms DESC
+            \\  );
             \\CREATE TABLE IF NOT EXISTS placement_decisions (
             \\  deployment_name TEXT NOT NULL REFERENCES deployments(name) ON DELETE CASCADE,
             \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -754,6 +813,7 @@ pub const Registry = struct {
         defer self.mutex.unlock(self.io);
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
+        try self.markDeploymentLifecycleRelease(name, now_unix_ms);
         var statement = try self.prepare("DELETE FROM deployments WHERE name=?;");
         defer statement.finalize();
         try statement.bindText(1, name);
@@ -762,6 +822,47 @@ pub const Registry = struct {
         if (deleted) try self.audit(now_unix_ms, "", "deployment.deleted", name);
         try self.exec("COMMIT;");
         return deleted;
+    }
+
+    fn markDeploymentLifecycleRelease(
+        self: *Registry,
+        deployment_name: []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        var exhausted = try self.prepare(
+            \\SELECT 1 FROM accelerator_allocation_commands
+            \\WHERE deployment_name=? AND action='run' AND phase<>'released'
+            \\  AND generation>=? LIMIT 1;
+        );
+        defer exhausted.finalize();
+        try exhausted.bindText(1, deployment_name);
+        try exhausted.bindInt64(2, std.math.maxInt(i64));
+        if (try exhausted.row()) return error.AllocationGenerationExhausted;
+
+        var update = try self.prepare(
+            \\UPDATE accelerator_allocation_commands
+            \\SET generation=generation+1, action='release',
+            \\    phase='release_requested', updated_unix_ms=?
+            \\WHERE deployment_name=? AND action='run' AND phase<>'released';
+        );
+        defer update.finalize();
+        try update.bindInt64(1, now_unix_ms);
+        try update.bindText(2, deployment_name);
+        try update.done();
+
+        var claims = try self.prepare(
+            \\UPDATE accelerator_allocation_claims
+            \\SET role='retiring', updated_unix_ms=?
+            \\WHERE deployment_name=? AND allocation_id IN (
+            \\  SELECT allocation_id FROM accelerator_allocation_commands
+            \\  WHERE deployment_name=? AND action='release' AND phase<>'released'
+            \\);
+        );
+        defer claims.finalize();
+        try claims.bindInt64(1, now_unix_ms);
+        try claims.bindText(2, deployment_name);
+        try claims.bindText(3, deployment_name);
+        try claims.done();
     }
 
     pub fn rollbackDeployment(self: *Registry, name: []const u8, now_unix_ms: i64) !bool {
@@ -800,6 +901,10 @@ pub const Registry = struct {
         const supports_accelerator_requirements = hasFeature(
             node_report.value.features,
             heartbeat.feature_accelerator_requirements_v1,
+        );
+        const supports_accelerator_lifecycle = hasFeature(
+            node_report.value.features,
+            heartbeat.feature_accelerator_lifecycle_v1,
         );
 
         try self.exec("BEGIN IMMEDIATE;");
@@ -889,6 +994,12 @@ pub const Registry = struct {
 
             if (parsed_spec.value.resources) |resources| {
                 if (parsed_spec.value.desired == .stopped) {
+                    if (supports_accelerator_lifecycle)
+                        try self.ensureLifecycleRelease(
+                            parsed_spec.value.name,
+                            node_id,
+                            now_unix_ms,
+                        );
                     try self.releasePlacement(parsed_spec.value.name, node_id);
                 } else {
                     if (!supports_accelerator_requirements) {
@@ -902,6 +1013,21 @@ pub const Registry = struct {
                         const fallback = previous_spec orelse continue;
                         if (!try isCpuDeploymentSpec(self.allocator, fallback)) continue;
                         emitted_spec = fallback;
+                    } else if (supports_accelerator_lifecycle) {
+                        var placement = try self.syncLifecycleAllocation(
+                            node_report.value,
+                            parsed_spec.value,
+                            resources.accelerators,
+                            now_unix_ms,
+                        );
+                        defer placement.deinit();
+                        try self.recordPlacementDecision(
+                            parsed_spec.value,
+                            node_id,
+                            placement.ready,
+                            placement.reason_code,
+                            now_unix_ms,
+                        );
                     } else {
                         var placement = try self.placeAccelerators(
                             node_report.value,
@@ -936,6 +1062,12 @@ pub const Registry = struct {
                     }
                 }
             } else {
+                if (supports_accelerator_lifecycle)
+                    try self.ensureLifecycleRelease(
+                        parsed_spec.value.name,
+                        node_id,
+                        now_unix_ms,
+                    );
                 try self.releasePlacement(parsed_spec.value.name, node_id);
             }
             if (!first) try output.append(self.allocator, ',');
@@ -948,9 +1080,447 @@ pub const Registry = struct {
             try output.appendSlice(self.allocator, ",\"accelerator_assignments\":");
             try output.appendSlice(self.allocator, assignment_output.items);
         }
+        if (supports_accelerator_lifecycle) {
+            try self.releaseOrphanedLifecycleAllocations(node_id, now_unix_ms);
+            try output.appendSlice(self.allocator, ",\"accelerator_allocations\":");
+            try self.appendLifecycleAllocations(&output, node_id);
+        }
         try output.appendSlice(self.allocator, "}\n");
         try self.exec("COMMIT;");
         return try output.toOwnedSlice(self.allocator);
+    }
+
+    fn syncLifecycleAllocation(
+        self: *Registry,
+        report: heartbeat.Heartbeat,
+        deployment: orchestration.Deployment,
+        requirement: accelerator.Requirement,
+        now_unix_ms: i64,
+    ) !PlacementResult {
+        var existing = try self.loadLifecycleCommand(report.node_id, deployment.name);
+        defer if (existing) |*command| command.deinit();
+        const inventory = report.accelerator_inventory orelse
+            return self.blockedPlacement(if (existing == null)
+                "inventory_missing"
+            else
+                "assigned_device_unconfirmed");
+
+        if (existing) |*command| {
+            if ((command.phase == .failed or command.phase == .ambiguous) and
+                command.phase != .released)
+                return self.blockedPlacement("allocation_recovery_required");
+            if (command.action == .release and command.phase != .released)
+                return self.blockedPlacement("accelerator_release_in_progress");
+            if (command.action == .run and command.phase != .released) {
+                if (command.revision == deployment.revision) {
+                    if (inventory.status == .complete and
+                        !reservationMatches(inventory, requirement, command.ids.items))
+                    {
+                        const reason = if (reservationIdsPresent(inventory, command.ids.items))
+                            "assigned_device_incompatible"
+                        else
+                            "assigned_device_missing";
+                        return self.blockedPlacement(reason);
+                    }
+                    return .{
+                        .ids = try cloneIds(self.allocator, command.ids.items),
+                        .ready = true,
+                        .reason_code = "",
+                    };
+                }
+
+                if (command.phase != .active)
+                    return self.blockedPlacement("allocation_operation_in_progress");
+
+                if (inventory.status != .complete)
+                    return self.blockedPlacement("assigned_device_unconfirmed");
+                if (reservationMatches(inventory, requirement, command.ids.items)) {
+                    try self.writeLifecycleRun(
+                        report.node_id,
+                        deployment.name,
+                        command.allocation_id,
+                        try nextAllocationGeneration(command.generation),
+                        deployment.revision,
+                        command.ids.items,
+                        now_unix_ms,
+                    );
+                    return .{
+                        .ids = try cloneIds(self.allocator, command.ids.items),
+                        .ready = true,
+                        .reason_code = "",
+                    };
+                }
+                try self.markLifecycleRelease(command.*, now_unix_ms);
+                return self.blockedPlacement("accelerator_release_in_progress");
+            }
+        }
+
+        if (inventory.status != .complete)
+            return self.blockedPlacement("inventory_unconfirmed");
+        if (inventory.accelerators.len == 0)
+            return self.blockedPlacement("no_accelerator");
+
+        // An A2 reservation is logical-only and never launched. Adopt a still
+        // compatible one when the agent upgrades to the fenced lifecycle.
+        var legacy = try self.loadExistingReservation(report.node_id, deployment.name);
+        defer legacy.ids.deinit();
+        if (legacy.ids.items.len > 0 and
+            reservationMatches(inventory, requirement, legacy.ids.items))
+        {
+            const allocation_id = if (existing) |command|
+                try self.allocator.dupe(u8, command.allocation_id)
+            else
+                try lifecycleAllocationIdAlloc(self.allocator, report.node_id, deployment.name);
+            defer self.allocator.free(allocation_id);
+            try self.writeLifecycleRun(
+                report.node_id,
+                deployment.name,
+                allocation_id,
+                if (existing) |command|
+                    try nextAllocationGeneration(command.generation)
+                else
+                    1,
+                deployment.revision,
+                legacy.ids.items,
+                now_unix_ms,
+            );
+            try self.deleteLegacyReservation(report.node_id, deployment.name);
+            return .{
+                .ids = try cloneIds(self.allocator, legacy.ids.items),
+                .ready = true,
+                .reason_code = "",
+            };
+        }
+        if (legacy.ids.items.len > 0)
+            try self.deleteLegacyReservation(report.node_id, deployment.name);
+
+        var reserved = try self.loadLifecycleReservedIds(report.node_id, deployment.name);
+        defer reserved.deinit();
+        const selected = accelerator.selectAlloc(
+            self.allocator,
+            inventory,
+            requirement,
+            reserved.items,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.blockedPlacement(selectionReason(err)),
+        };
+        defer self.allocator.free(selected);
+        const allocation_id = if (existing) |command|
+            try self.allocator.dupe(u8, command.allocation_id)
+        else
+            try lifecycleAllocationIdAlloc(self.allocator, report.node_id, deployment.name);
+        defer self.allocator.free(allocation_id);
+        try self.writeLifecycleRun(
+            report.node_id,
+            deployment.name,
+            allocation_id,
+            if (existing) |command|
+                try nextAllocationGeneration(command.generation)
+            else
+                1,
+            deployment.revision,
+            selected,
+            now_unix_ms,
+        );
+        return .{
+            .ids = try cloneIds(self.allocator, selected),
+            .ready = true,
+            .reason_code = "",
+        };
+    }
+
+    fn writeLifecycleRun(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+        allocation_id: []const u8,
+        generation: u64,
+        revision: u64,
+        device_ids: []const []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        const desired: allocation.DesiredAllocation = .{
+            .allocation_id = allocation_id,
+            .generation = generation,
+            .deployment = deployment_name,
+            .revision = revision,
+            .action = .run,
+            .target_device_ids = device_ids,
+        };
+        try allocation.validateDesired(desired);
+        var command = try self.prepare(
+            \\INSERT INTO accelerator_allocation_commands (
+            \\  node_id, deployment_name, allocation_id, generation, revision,
+            \\  action, phase, created_unix_ms, updated_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?, 'run', 'pending', ?, ?)
+            \\ON CONFLICT(node_id, deployment_name) DO UPDATE SET
+            \\  allocation_id=excluded.allocation_id,
+            \\  generation=excluded.generation,
+            \\  revision=excluded.revision,
+            \\  action='run', phase='pending', updated_unix_ms=excluded.updated_unix_ms;
+        );
+        defer command.finalize();
+        try command.bindText(1, node_id);
+        try command.bindText(2, deployment_name);
+        try command.bindText(3, allocation_id);
+        try command.bindInt64(4, @intCast(generation));
+        try command.bindInt64(5, @intCast(revision));
+        try command.bindInt64(6, now_unix_ms);
+        try command.bindInt64(7, now_unix_ms);
+        try command.done();
+
+        var clear = try self.prepare(
+            "DELETE FROM accelerator_allocation_claims WHERE allocation_id=?;",
+        );
+        defer clear.finalize();
+        try clear.bindText(1, allocation_id);
+        try clear.done();
+        for (device_ids) |device_id| {
+            var claim = try self.prepare(
+                \\INSERT INTO accelerator_allocation_claims (
+                \\  node_id, accelerator_id, allocation_id, deployment_name,
+                \\  generation, revision, role, updated_unix_ms
+                \\) VALUES (?, ?, ?, ?, ?, ?, 'candidate', ?);
+            );
+            defer claim.finalize();
+            try claim.bindText(1, node_id);
+            try claim.bindText(2, device_id);
+            try claim.bindText(3, allocation_id);
+            try claim.bindText(4, deployment_name);
+            try claim.bindInt64(5, @intCast(generation));
+            try claim.bindInt64(6, @intCast(revision));
+            try claim.bindInt64(7, now_unix_ms);
+            try claim.done();
+        }
+    }
+
+    fn ensureLifecycleRelease(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        var existing = try self.loadLifecycleCommand(node_id, deployment_name);
+        defer if (existing) |*command| command.deinit();
+        const command = existing orelse return;
+        if (command.phase == .released or command.action == .release) return;
+        try self.markLifecycleRelease(command, now_unix_ms);
+    }
+
+    fn markLifecycleRelease(
+        self: *Registry,
+        command: LifecycleCommand,
+        now_unix_ms: i64,
+    ) !void {
+        if (command.ids.items.len == 0) return error.InconsistentAllocationClaims;
+        const next_generation = try nextAllocationGeneration(command.generation);
+        const desired: allocation.DesiredAllocation = .{
+            .allocation_id = command.allocation_id,
+            .generation = next_generation,
+            .deployment = command.deployment_name,
+            .revision = command.revision,
+            .action = .release,
+            .retiring_device_ids = command.ids.items,
+        };
+        try allocation.validateDesired(desired);
+        var update = try self.prepare(
+            \\UPDATE accelerator_allocation_commands
+            \\SET generation=?, action='release',
+            \\    phase='release_requested', updated_unix_ms=?
+            \\WHERE node_id=? AND deployment_name=?;
+        );
+        defer update.finalize();
+        try update.bindInt64(1, @intCast(next_generation));
+        try update.bindInt64(2, now_unix_ms);
+        try update.bindText(3, command.node_id);
+        try update.bindText(4, command.deployment_name);
+        try update.done();
+        var claims = try self.prepare(
+            \\UPDATE accelerator_allocation_claims
+            \\SET role='retiring', updated_unix_ms=?
+            \\WHERE allocation_id=?;
+        );
+        defer claims.finalize();
+        try claims.bindInt64(1, now_unix_ms);
+        try claims.bindText(2, command.allocation_id);
+        try claims.done();
+    }
+
+    fn releaseOrphanedLifecycleAllocations(
+        self: *Registry,
+        node_id: []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        var query = try self.prepare(
+            \\SELECT deployment_name FROM accelerator_allocation_commands command
+            \\WHERE node_id=? AND action='run' AND phase<>'released'
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM workload_assignments assignment
+            \\    WHERE assignment.deployment_name=command.deployment_name
+            \\      AND assignment.node_id=command.node_id
+            \\  ) ORDER BY deployment_name;
+        );
+        defer query.finalize();
+        try query.bindText(1, node_id);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |name| self.allocator.free(name);
+            names.deinit(self.allocator);
+        }
+        while (try query.row())
+            try names.append(self.allocator, try self.allocator.dupe(u8, query.columnText(0)));
+        for (names.items) |name|
+            try self.ensureLifecycleRelease(name, node_id, now_unix_ms);
+    }
+
+    fn appendLifecycleAllocations(
+        self: *Registry,
+        output: *std.ArrayList(u8),
+        node_id: []const u8,
+    ) !void {
+        try output.append(self.allocator, '[');
+        var commands = try self.prepare(
+            \\SELECT deployment_name, allocation_id, generation, revision, action
+            \\FROM accelerator_allocation_commands
+            \\WHERE node_id=? AND phase<>'released' ORDER BY deployment_name;
+        );
+        defer commands.finalize();
+        try commands.bindText(1, node_id);
+        var first = true;
+        while (try commands.row()) {
+            const deployment_name = try self.allocator.dupe(u8, commands.columnText(0));
+            defer self.allocator.free(deployment_name);
+            const allocation_id = try self.allocator.dupe(u8, commands.columnText(1));
+            defer self.allocator.free(allocation_id);
+            const action = std.meta.stringToEnum(
+                allocation.DesiredAction,
+                commands.columnText(4),
+            ) orelse return error.InvalidAllocationAction;
+            var ids = try self.loadLifecycleClaimIds(allocation_id);
+            defer ids.deinit();
+            const desired: allocation.DesiredAllocation = .{
+                .allocation_id = allocation_id,
+                .generation = @intCast(commands.columnInt64(2)),
+                .deployment = deployment_name,
+                .revision = @intCast(commands.columnInt64(3)),
+                .action = action,
+                .target_device_ids = if (action == .run) ids.items else &.{},
+                .retiring_device_ids = if (action == .release) ids.items else &.{},
+            };
+            try allocation.validateDesired(desired);
+            const encoded = try std.json.Stringify.valueAlloc(self.allocator, desired, .{});
+            defer self.allocator.free(encoded);
+            if (!first) try output.append(self.allocator, ',');
+            first = false;
+            try output.appendSlice(self.allocator, encoded);
+        }
+        try output.append(self.allocator, ']');
+    }
+
+    fn loadLifecycleCommand(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !?LifecycleCommand {
+        var query = try self.prepare(
+            \\SELECT allocation_id, generation, revision, action, phase
+            \\FROM accelerator_allocation_commands
+            \\WHERE node_id=? AND deployment_name=?;
+        );
+        defer query.finalize();
+        try query.bindText(1, node_id);
+        try query.bindText(2, deployment_name);
+        if (!try query.row()) return null;
+        const action = std.meta.stringToEnum(
+            allocation.DesiredAction,
+            query.columnText(3),
+        ) orelse return error.InvalidAllocationAction;
+        const phase = std.meta.stringToEnum(
+            allocation.ObservedPhase,
+            query.columnText(4),
+        ) orelse return error.InvalidAllocationPhase;
+        const allocation_id = try self.allocator.dupe(u8, query.columnText(0));
+        errdefer self.allocator.free(allocation_id);
+        const owned_node_id = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(owned_node_id);
+        const owned_deployment = try self.allocator.dupe(u8, deployment_name);
+        errdefer self.allocator.free(owned_deployment);
+        var ids = try self.loadLifecycleClaimIds(allocation_id);
+        errdefer ids.deinit();
+        return .{
+            .allocator = self.allocator,
+            .node_id = owned_node_id,
+            .deployment_name = owned_deployment,
+            .allocation_id = allocation_id,
+            .generation = @intCast(query.columnInt64(1)),
+            .revision = @intCast(query.columnInt64(2)),
+            .action = action,
+            .phase = phase,
+            .ids = ids,
+        };
+    }
+
+    fn loadLifecycleClaimIds(
+        self: *Registry,
+        allocation_id: []const u8,
+    ) !OwnedIds {
+        var query = try self.prepare(
+            \\SELECT accelerator_id FROM accelerator_allocation_claims
+            \\WHERE allocation_id=? ORDER BY accelerator_id;
+        );
+        defer query.finalize();
+        try query.bindText(1, allocation_id);
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        while (try query.row())
+            try ids.append(self.allocator, try self.allocator.dupe(u8, query.columnText(0)));
+        return .{ .allocator = self.allocator, .items = try ids.toOwnedSlice(self.allocator) };
+    }
+
+    fn loadLifecycleReservedIds(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !OwnedIds {
+        var query = try self.prepare(
+            \\SELECT accelerator_id FROM accelerator_allocation_claims
+            \\WHERE node_id=? AND deployment_name<>?
+            \\UNION
+            \\SELECT accelerator_id FROM accelerator_reservations
+            \\WHERE node_id=? AND deployment_name<>?
+            \\ORDER BY accelerator_id;
+        );
+        defer query.finalize();
+        try query.bindText(1, node_id);
+        try query.bindText(2, deployment_name);
+        try query.bindText(3, node_id);
+        try query.bindText(4, deployment_name);
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        while (try query.row())
+            try ids.append(self.allocator, try self.allocator.dupe(u8, query.columnText(0)));
+        return .{ .allocator = self.allocator, .items = try ids.toOwnedSlice(self.allocator) };
+    }
+
+    fn deleteLegacyReservation(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !void {
+        var statement = try self.prepare(
+            "DELETE FROM accelerator_reservations WHERE node_id=? AND deployment_name=?;",
+        );
+        defer statement.finalize();
+        try statement.bindText(1, node_id);
+        try statement.bindText(2, deployment_name);
+        try statement.done();
     }
 
     fn placeAccelerators(
@@ -960,6 +1530,8 @@ pub const Registry = struct {
         requirement: accelerator.Requirement,
         now_unix_ms: i64,
     ) !PlacementResult {
+        if (try self.hasActiveLifecycleCommand(report.node_id, deployment.name))
+            return self.blockedPlacement("agent_feature_regressed");
         var existing = try self.loadExistingReservation(report.node_id, deployment.name);
         defer existing.ids.deinit();
         const inventory = report.accelerator_inventory orelse
@@ -969,6 +1541,14 @@ pub const Registry = struct {
                 "assigned_device_unconfirmed");
 
         if (existing.ids.items.len > 0) {
+            var other_claims = try self.loadOtherReservationIds(report.node_id, deployment.name);
+            defer other_claims.deinit();
+            for (existing.ids.items) |existing_id| {
+                for (other_claims.items) |claimed_id| {
+                    if (std.mem.eql(u8, existing_id, claimed_id))
+                        return self.blockedPlacement("accelerator_capacity_exhausted");
+                }
+            }
             if (inventory.status != .unavailable and
                 reservationMatches(inventory, requirement, existing.ids.items))
             {
@@ -1092,11 +1672,17 @@ pub const Registry = struct {
     ) !OwnedIds {
         var statement = try self.prepare(
             \\SELECT accelerator_id FROM accelerator_reservations
-            \\WHERE node_id=? AND deployment_name<>? ORDER BY accelerator_id;
+            \\WHERE node_id=? AND deployment_name<>?
+            \\UNION
+            \\SELECT accelerator_id FROM accelerator_allocation_claims
+            \\WHERE node_id=? AND deployment_name<>?
+            \\ORDER BY accelerator_id;
         );
         defer statement.finalize();
         try statement.bindText(1, node_id);
         try statement.bindText(2, deployment_name);
+        try statement.bindText(3, node_id);
+        try statement.bindText(4, deployment_name);
         var ids: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (ids.items) |id| self.allocator.free(id);
@@ -1105,6 +1691,21 @@ pub const Registry = struct {
         while (try statement.row())
             try ids.append(self.allocator, try self.allocator.dupe(u8, statement.columnText(0)));
         return .{ .allocator = self.allocator, .items = try ids.toOwnedSlice(self.allocator) };
+    }
+
+    fn hasActiveLifecycleCommand(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !bool {
+        var query = try self.prepare(
+            \\SELECT 1 FROM accelerator_allocation_commands
+            \\WHERE node_id=? AND deployment_name=? AND phase<>'released' LIMIT 1;
+        );
+        defer query.finalize();
+        try query.bindText(1, node_id);
+        try query.bindText(2, deployment_name);
+        return try query.row();
     }
 
     fn recordPlacementDecision(
@@ -1224,6 +1825,126 @@ pub const Registry = struct {
         } else if (report.state == .healthy or report.state == .stopped) {
             try self.maybeAdvanceRollout(report.deployment, received_unix_ms);
         }
+
+        try self.exec("COMMIT;");
+        return true;
+    }
+
+    /// Persist a generation-fenced allocation observation. The agent can only
+    /// report `released_ack_pending`; claim deletion and the final `released`
+    /// phase are owned by this transaction.
+    pub fn recordAllocationStatus(
+        self: *Registry,
+        report: allocation.Status,
+        received_unix_ms: i64,
+    ) !bool {
+        allocation.validateStatus(report) catch return error.InvalidAllocationStatus;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        var current = try self.loadLifecycleCommand(report.node_id, report.deployment);
+        defer if (current) |*command| command.deinit();
+        const command = current orelse {
+            try self.exec("ROLLBACK;");
+            return false;
+        };
+
+        // An acknowledgement response may be lost. Keep the released command
+        // as an idempotency tombstone and accept the exact retry.
+        if (command.action == .release and command.phase == .released and
+            report.phase == .released_ack_pending and
+            std.mem.eql(u8, report.allocation_id, command.allocation_id) and
+            report.generation == command.generation and
+            report.revision == command.revision)
+        {
+            try self.exec("COMMIT;");
+            return true;
+        }
+
+        const desired: allocation.DesiredAllocation = .{
+            .allocation_id = command.allocation_id,
+            .generation = command.generation,
+            .deployment = command.deployment_name,
+            .revision = command.revision,
+            .action = command.action,
+            .target_device_ids = if (command.action == .run) command.ids.items else &.{},
+            .retiring_device_ids = if (command.action == .release) command.ids.items else &.{},
+        };
+        allocation.validateStatusTransition(
+            report,
+            desired,
+            command.node_id,
+            command.phase,
+        ) catch return error.InvalidAllocationStatus;
+
+        const stored_phase: allocation.ObservedPhase = if (report.phase == .released_ack_pending)
+            .released
+        else
+            report.phase;
+        var update = try self.prepare(
+            \\UPDATE accelerator_allocation_commands
+            \\SET phase=?, updated_unix_ms=?
+            \\WHERE allocation_id=? AND generation=?;
+        );
+        defer update.finalize();
+        try update.bindText(1, @tagName(stored_phase));
+        try update.bindInt64(2, received_unix_ms);
+        try update.bindText(3, report.allocation_id);
+        try update.bindInt64(4, @intCast(report.generation));
+        try update.done();
+        if (c.sqlite3_changes(self.db) == 0)
+            return error.StaleAllocationStatus;
+
+        if (report.phase == .active) {
+            var activate = try self.prepare(
+                \\UPDATE accelerator_allocation_claims
+                \\SET role='active', updated_unix_ms=?
+                \\WHERE allocation_id=? AND generation=?;
+            );
+            defer activate.finalize();
+            try activate.bindInt64(1, received_unix_ms);
+            try activate.bindText(2, report.allocation_id);
+            try activate.bindInt64(3, @intCast(report.generation));
+            try activate.done();
+        } else if (report.phase == .released_ack_pending) {
+            var release = try self.prepare(
+                \\DELETE FROM accelerator_allocation_claims
+                \\WHERE allocation_id=? AND generation=?;
+            );
+            defer release.finalize();
+            try release.bindText(1, report.allocation_id);
+            try release.bindInt64(2, @intCast(report.generation));
+            try release.done();
+        }
+
+        var history = try self.prepare(
+            \\INSERT INTO accelerator_allocation_status_history (
+            \\  allocation_id, generation, node_id, deployment_name, revision,
+            \\  phase, message, observed_unix_ms, received_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        );
+        defer history.finalize();
+        try history.bindText(1, report.allocation_id);
+        try history.bindInt64(2, @intCast(report.generation));
+        try history.bindText(3, report.node_id);
+        try history.bindText(4, report.deployment);
+        try history.bindInt64(5, @intCast(report.revision));
+        try history.bindText(6, @tagName(report.phase));
+        try history.bindText(7, report.message);
+        try history.bindInt64(8, report.observed_unix_ms);
+        try history.bindInt64(9, received_unix_ms);
+        try history.done();
+
+        var prune = try self.prepare(
+            "DELETE FROM accelerator_allocation_status_history WHERE received_unix_ms < ?;",
+        );
+        defer prune.finalize();
+        try prune.bindInt64(1, received_unix_ms -| workload_status_retention_ms);
+        try prune.done();
+        if (report.phase == .released_ack_pending)
+            try self.audit(received_unix_ms, report.node_id, "accelerator.released", report.deployment);
 
         try self.exec("COMMIT;");
         return true;
@@ -1580,6 +2301,26 @@ const ExistingReservation = struct {
     revision: ?u64,
 };
 
+const LifecycleCommand = struct {
+    allocator: std.mem.Allocator,
+    node_id: []const u8,
+    deployment_name: []const u8,
+    allocation_id: []const u8,
+    generation: u64,
+    revision: u64,
+    action: allocation.DesiredAction,
+    phase: allocation.ObservedPhase,
+    ids: OwnedIds,
+
+    fn deinit(self: *LifecycleCommand) void {
+        self.allocator.free(self.node_id);
+        self.allocator.free(self.deployment_name);
+        self.allocator.free(self.allocation_id);
+        self.ids.deinit();
+        self.* = undefined;
+    }
+};
+
 const PlacementResult = struct {
     ids: OwnedIds,
     ready: bool,
@@ -1687,6 +2428,29 @@ fn cloneIds(allocator: std.mem.Allocator, input: []const []const u8) !OwnedIds {
     return .{ .allocator = allocator, .items = items };
 }
 
+fn lifecycleAllocationIdAlloc(
+    allocator: std.mem.Allocator,
+    node_id: []const u8,
+    deployment_name: []const u8,
+) ![]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var hash = Sha256.init(.{});
+    hash.update("nimbus.accelerator.allocation.v1\x00");
+    hash.update(node_id);
+    hash.update("\x00");
+    hash.update(deployment_name);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "alloc-{s}", .{encoded});
+}
+
+fn nextAllocationGeneration(current: u64) !u64 {
+    if (current == 0 or current >= std.math.maxInt(i64))
+        return error.AllocationGenerationExhausted;
+    return current + 1;
+}
+
 fn reservationMatches(
     inventory: accelerator.InventoryReport,
     requirement: accelerator.Requirement,
@@ -1745,6 +2509,80 @@ fn logSqliteError(db: *c.sqlite3, operation: []const u8) void {
 
 fn status(now_unix_ms: i64, last_seen_unix_ms: i64, stale_after_ms: i64) []const u8 {
     return if (now_unix_ms - last_seen_unix_ms > stale_after_ms) "stale" else "online";
+}
+
+const lifecycle_test_devices = [_]accelerator.Device{.{
+    .id = "gpu:nvidia:a",
+    .kind = .gpu,
+    .vendor = "NVIDIA",
+    .model = "L4",
+    .source = "fixture",
+    .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+    .capabilities = &.{"fp16"},
+}};
+
+const lifecycle_test_probes = [_]accelerator.ProbeOutcome{.{
+    .name = "fixture",
+    .status = .ok,
+    .devices_found = 1,
+}};
+
+fn lifecycleTestHeartbeat(features: []const []const u8) heartbeat.Heartbeat {
+    return .{
+        .node_id = "gpu-edge",
+        .hostname = "gpu-edge",
+        .role = "edge",
+        .features = features,
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 8 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &lifecycle_test_devices,
+            .probes = &lifecycle_test_probes,
+        },
+        .timestamp_unix_ms = 1000,
+    };
+}
+
+fn lifecycleTestDeployment(name: []const u8) orchestration.Deployment {
+    return .{
+        .name = name,
+        .revision = 1,
+        .runtime = .{
+            .kind = .docker,
+            .reference = "registry.example/vision@sha256:" ++ ("ab" ** 32),
+        },
+        .resources = .{ .accelerators = .{
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .capabilities = &.{"fp16"},
+        } },
+        .targets = .{ .all = true },
+    };
+}
+
+fn recordLifecycleTestHeartbeat(
+    registry: *Registry,
+    report: heartbeat.Heartbeat,
+    now_unix_ms: i64,
+) !void {
+    const json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+    defer std.testing.allocator.free(json);
+    try registry.recordHeartbeat(report, json, now_unix_ms);
+}
+
+fn applyLifecycleTestDeployment(
+    registry: *Registry,
+    deployment: orchestration.Deployment,
+    now_unix_ms: i64,
+) !void {
+    const json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        deployment,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer std.testing.allocator.free(json);
+    try registry.applyDeployment(deployment, json, now_unix_ms);
 }
 
 test "SQLite registry persists and marks nodes stale" {
@@ -2009,6 +2847,362 @@ test "accelerator placement is deterministic and exclusive" {
     );
     try std.testing.expectEqual(@as(u64, 1), legacy_desired.value.deployments[0].revision);
     try std.testing.expect(legacy_desired.value.deployments[0].resources == null);
+}
+
+test "fenced accelerator claims survive deletion until central release acknowledgement" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const devices = [_]accelerator.Device{.{
+        .id = "gpu:nvidia:a",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "L4",
+        .source = "fixture",
+        .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+        .capabilities = &.{"fp16"},
+    }};
+    const probes = [_]accelerator.ProbeOutcome{.{
+        .name = "fixture",
+        .status = .ok,
+        .devices_found = 1,
+    }};
+    const report: heartbeat.Heartbeat = .{
+        .node_id = "gpu-edge",
+        .hostname = "gpu-edge",
+        .role = "edge",
+        .features = &.{
+            heartbeat.feature_accelerator_requirements_v1,
+            heartbeat.feature_accelerator_lifecycle_v1,
+        },
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 8 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &devices,
+            .probes = &probes,
+        },
+        .timestamp_unix_ms = 1000,
+    };
+    const heartbeat_json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+    defer std.testing.allocator.free(heartbeat_json);
+    try registry.recordHeartbeat(report, heartbeat_json, 1000);
+
+    const deployment: orchestration.Deployment = .{
+        .name = "vision",
+        .revision = 1,
+        .runtime = .{
+            .kind = .docker,
+            .reference = "registry.example/vision@sha256:" ++ ("ab" ** 32),
+        },
+        .resources = .{ .accelerators = .{
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .capabilities = &.{"fp16"},
+        } },
+        .targets = .{ .all = true },
+    };
+    const deployment_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        deployment,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer std.testing.allocator.free(deployment_json);
+    try registry.applyDeployment(deployment, deployment_json, 1100);
+
+    const desired_json = (try registry.desiredStateForNode("gpu-edge", 1200)).?;
+    defer std.testing.allocator.free(desired_json);
+    var desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        desired_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer desired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), desired.value.accelerator_assignments.len);
+    try std.testing.expectEqual(@as(usize, 1), desired.value.accelerator_allocations.len);
+    const run_command = desired.value.accelerator_allocations[0];
+    try std.testing.expectEqual(allocation.DesiredAction.run, run_command.action);
+    try std.testing.expectEqual(@as(u64, 1), run_command.generation);
+    try std.testing.expectEqualStrings("gpu:nvidia:a", run_command.target_device_ids[0]);
+
+    var run_status: allocation.Status = .{
+        .allocation_id = run_command.allocation_id,
+        .generation = run_command.generation,
+        .node_id = "gpu-edge",
+        .deployment = "vision",
+        .revision = 1,
+        .phase = .active,
+        .observed_unix_ms = 1201,
+    };
+    try std.testing.expectError(
+        error.InvalidAllocationStatus,
+        registry.recordAllocationStatus(run_status, 1201),
+    );
+    const run_phases = [_]allocation.ObservedPhase{
+        .pending,
+        .prepared,
+        .starting_target,
+        .target_started,
+        .verifying,
+        .active,
+    };
+    for (run_phases, 0..) |phase, index| {
+        run_status.phase = phase;
+        run_status.observed_unix_ms = 1210 + @as(i64, @intCast(index));
+        try std.testing.expect(try registry.recordAllocationStatus(
+            run_status,
+            run_status.observed_unix_ms,
+        ));
+    }
+
+    var active_claim = try registry.prepare(
+        \\SELECT role, generation FROM accelerator_allocation_claims
+        \\WHERE node_id='gpu-edge' AND accelerator_id='gpu:nvidia:a';
+    );
+    defer active_claim.finalize();
+    try std.testing.expect(try active_claim.row());
+    try std.testing.expectEqualStrings("active", active_claim.columnText(0));
+    try std.testing.expectEqual(@as(i64, 1), active_claim.columnInt64(1));
+
+    try std.testing.expect(try registry.deleteDeployment("vision", 1300));
+    const release_json = (try registry.desiredStateForNode("gpu-edge", 1400)).?;
+    defer std.testing.allocator.free(release_json);
+    var release_desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        release_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer release_desired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), release_desired.value.deployments.len);
+    try std.testing.expectEqual(@as(usize, 1), release_desired.value.accelerator_allocations.len);
+    const release_command = release_desired.value.accelerator_allocations[0];
+    try std.testing.expectEqual(allocation.DesiredAction.release, release_command.action);
+    try std.testing.expectEqual(@as(u64, 2), release_command.generation);
+    try std.testing.expectEqualStrings("gpu:nvidia:a", release_command.retiring_device_ids[0]);
+
+    var stale = run_status;
+    stale.phase = .failed;
+    stale.observed_unix_ms = 1401;
+    try std.testing.expectError(
+        error.InvalidAllocationStatus,
+        registry.recordAllocationStatus(stale, 1401),
+    );
+
+    var release_status: allocation.Status = .{
+        .allocation_id = release_command.allocation_id,
+        .generation = release_command.generation,
+        .node_id = "gpu-edge",
+        .deployment = "vision",
+        .revision = 1,
+        .phase = .release_requested,
+        .observed_unix_ms = 1410,
+    };
+    const release_phases = [_]allocation.ObservedPhase{
+        .release_requested,
+        .stopping,
+        .released_ack_pending,
+    };
+    for (release_phases, 0..) |phase, index| {
+        release_status.phase = phase;
+        release_status.observed_unix_ms = 1410 + @as(i64, @intCast(index));
+        try std.testing.expect(try registry.recordAllocationStatus(
+            release_status,
+            release_status.observed_unix_ms,
+        ));
+    }
+    // Lost HTTP responses are safe: the exact final report is idempotent.
+    try std.testing.expect(try registry.recordAllocationStatus(release_status, 1420));
+
+    var claim_count = try registry.prepare(
+        "SELECT COUNT(*) FROM accelerator_allocation_claims WHERE node_id='gpu-edge';",
+    );
+    defer claim_count.finalize();
+    try std.testing.expect(try claim_count.row());
+    try std.testing.expectEqual(@as(i64, 0), claim_count.columnInt64(0));
+    const released_json = (try registry.desiredStateForNode("gpu-edge", 1500)).?;
+    defer std.testing.allocator.free(released_json);
+    var released_desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        released_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer released_desired.deinit();
+    try std.testing.expectEqual(@as(usize, 0), released_desired.value.accelerator_allocations.len);
+}
+
+test "lifecycle claims fence legacy placement and feature regression" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const lifecycle_features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    const lifecycle_report = lifecycleTestHeartbeat(&lifecycle_features);
+    try recordLifecycleTestHeartbeat(&registry, lifecycle_report, 1000);
+    try applyLifecycleTestDeployment(&registry, lifecycleTestDeployment("lifecycle"), 1100);
+
+    const first_desired = (try registry.desiredStateForNode("gpu-edge", 1200)).?;
+    defer std.testing.allocator.free(first_desired);
+    var first = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        first_desired,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.value.accelerator_allocations.len);
+    const allocation_id = try std.testing.allocator.dupe(
+        u8,
+        first.value.accelerator_allocations[0].allocation_id,
+    );
+    defer std.testing.allocator.free(allocation_id);
+
+    const repeated_desired = (try registry.desiredStateForNode("gpu-edge", 1210)).?;
+    defer std.testing.allocator.free(repeated_desired);
+    var repeated = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        repeated_desired,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer repeated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), repeated.value.accelerator_allocations.len);
+    try std.testing.expectEqualStrings(
+        allocation_id,
+        repeated.value.accelerator_allocations[0].allocation_id,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        repeated.value.accelerator_allocations[0].generation,
+    );
+
+    const legacy_features = [_][]const u8{heartbeat.feature_accelerator_requirements_v1};
+    const legacy_report = lifecycleTestHeartbeat(&legacy_features);
+    try recordLifecycleTestHeartbeat(&registry, legacy_report, 1300);
+    try applyLifecycleTestDeployment(&registry, lifecycleTestDeployment("legacy"), 1310);
+    const downgraded_desired = (try registry.desiredStateForNode("gpu-edge", 1400)).?;
+    defer std.testing.allocator.free(downgraded_desired);
+
+    const lifecycle_inspect = (try registry.inspectDeployment("lifecycle")).?;
+    defer std.testing.allocator.free(lifecycle_inspect);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        lifecycle_inspect,
+        "\"reason_code\":\"agent_feature_regressed\"",
+    ) != null);
+    const legacy_inspect = (try registry.inspectDeployment("legacy")).?;
+    defer std.testing.allocator.free(legacy_inspect);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        legacy_inspect,
+        "\"reason_code\":\"accelerator_capacity_exhausted\"",
+    ) != null);
+
+    var legacy_reservations = try registry.prepare(
+        "SELECT COUNT(*) FROM accelerator_reservations WHERE node_id='gpu-edge';",
+    );
+    defer legacy_reservations.finalize();
+    try std.testing.expect(try legacy_reservations.row());
+    try std.testing.expectEqual(@as(i64, 0), legacy_reservations.columnInt64(0));
+}
+
+test "delete and recreate cannot cancel a fenced release" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    try recordLifecycleTestHeartbeat(&registry, lifecycleTestHeartbeat(&features), 1000);
+    const deployment = lifecycleTestDeployment("vision");
+    try applyLifecycleTestDeployment(&registry, deployment, 1100);
+
+    const run_json = (try registry.desiredStateForNode("gpu-edge", 1200)).?;
+    defer std.testing.allocator.free(run_json);
+    var run_desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        run_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer run_desired.deinit();
+    const allocation_id = try std.testing.allocator.dupe(
+        u8,
+        run_desired.value.accelerator_allocations[0].allocation_id,
+    );
+    defer std.testing.allocator.free(allocation_id);
+
+    try std.testing.expect(try registry.deleteDeployment("vision", 1300));
+    try applyLifecycleTestDeployment(&registry, deployment, 1310);
+    const release_json = (try registry.desiredStateForNode("gpu-edge", 1400)).?;
+    defer std.testing.allocator.free(release_json);
+    var release_desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        release_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer release_desired.deinit();
+    try std.testing.expectEqual(@as(usize, 1), release_desired.value.deployments.len);
+    try std.testing.expectEqual(@as(usize, 1), release_desired.value.accelerator_allocations.len);
+    const release = release_desired.value.accelerator_allocations[0];
+    try std.testing.expectEqual(allocation.DesiredAction.release, release.action);
+    try std.testing.expectEqual(@as(u64, 2), release.generation);
+    try std.testing.expectEqualStrings(allocation_id, release.allocation_id);
+
+    var release_status: allocation.Status = .{
+        .allocation_id = allocation_id,
+        .generation = 2,
+        .node_id = "gpu-edge",
+        .deployment = "vision",
+        .revision = 1,
+        .phase = .release_requested,
+        .observed_unix_ms = 1410,
+    };
+    const release_phases = [_]allocation.ObservedPhase{
+        .release_requested,
+        .stopping,
+        .released_ack_pending,
+    };
+    for (release_phases, 0..) |phase, index| {
+        release_status.phase = phase;
+        release_status.observed_unix_ms = 1410 + @as(i64, @intCast(index));
+        try std.testing.expect(try registry.recordAllocationStatus(
+            release_status,
+            release_status.observed_unix_ms,
+        ));
+    }
+
+    const replacement_json = (try registry.desiredStateForNode("gpu-edge", 1500)).?;
+    defer std.testing.allocator.free(replacement_json);
+    var replacement = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        replacement_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer replacement.deinit();
+    try std.testing.expectEqual(@as(usize, 1), replacement.value.accelerator_allocations.len);
+    try std.testing.expectEqual(
+        allocation.DesiredAction.run,
+        replacement.value.accelerator_allocations[0].action,
+    );
+    try std.testing.expectEqual(@as(u64, 3), replacement.value.accelerator_allocations[0].generation);
+    try std.testing.expectEqualStrings(
+        allocation_id,
+        replacement.value.accelerator_allocations[0].allocation_id,
+    );
+}
+
+test "allocation generation rejects invalid and exhausted counters" {
+    try std.testing.expectEqual(@as(u64, 2), try nextAllocationGeneration(1));
+    try std.testing.expectError(error.AllocationGenerationExhausted, nextAllocationGeneration(0));
+    try std.testing.expectError(
+        error.AllocationGenerationExhausted,
+        nextAllocationGeneration(std.math.maxInt(i64)),
+    );
 }
 
 test "heartbeat history is sampled and enrollment audit is not duplicated" {

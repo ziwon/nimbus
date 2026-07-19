@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const accelerator = @import("accelerator.zig");
+const allocation = @import("allocation.zig");
 const heartbeat = @import("heartbeat.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
@@ -168,6 +169,12 @@ fn handleConnection(
         if (request.head.method != .POST)
             return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
         return ingestWorkloadStatus(init, registry, &request, node_id);
+    }
+
+    if (allocationStatusNodeId(request.head.target)) |node_id| {
+        if (request.head.method != .POST)
+            return respondJson(&request, "{\"error\":\"method_not_allowed\"}\n", .method_not_allowed);
+        return ingestAllocationStatus(init, registry, &request, node_id);
     }
 
     if (std.mem.eql(u8, request.head.target, "/v1/deployments")) {
@@ -353,6 +360,39 @@ fn ingestWorkloadStatus(
     return respondJson(request, "{\"accepted\":true}\n", .accepted);
 }
 
+fn ingestAllocationStatus(
+    init: std.process.Init,
+    registry: *storage.Registry,
+    request: *std.http.Server.Request,
+    node_id: []const u8,
+) !void {
+    if (!identity.isValid(node_id))
+        return respondJson(request, "{\"error\":\"invalid_node_id\"}\n", .bad_request);
+    const body = readBodyAlloc(init, request, max_status_bytes) catch |err| switch (err) {
+        error.StreamTooLong => return respondJson(request, "{\"error\":\"status_too_large\"}\n", .payload_too_large),
+        else => |other| return other,
+    };
+    defer init.gpa.free(body);
+
+    var parsed = std.json.parseFromSlice(allocation.Status, init.gpa, body, .{
+        .ignore_unknown_fields = false,
+    }) catch return respondJson(request, "{\"error\":\"invalid_allocation_status_json\"}\n", .bad_request);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.node_id, node_id))
+        return respondJson(request, "{\"error\":\"invalid_allocation_status\"}\n", .bad_request);
+
+    const received = Io.Clock.real.now(init.io).toMilliseconds();
+    const recorded = registry.recordAllocationStatus(parsed.value, received) catch |err| switch (err) {
+        error.InvalidAllocationStatus, error.StaleAllocationStatus => return respondJson(request, "{\"error\":\"allocation_status_conflict\"}\n", .conflict),
+        else => |other| return other,
+    };
+    if (!recorded)
+        return respondJson(request, "{\"error\":\"allocation_not_found\"}\n", .not_found);
+    if (parsed.value.phase == .released_ack_pending)
+        return respondJson(request, "{\"accepted\":true,\"released\":true}\n", .accepted);
+    return respondJson(request, "{\"accepted\":true}\n", .accepted);
+}
+
 fn readBodyAlloc(
     init: std.process.Init,
     request: *std.http.Server.Request,
@@ -369,6 +409,10 @@ fn desiredStateNodeId(target: []const u8) ?[]const u8 {
 
 fn statusNodeId(target: []const u8) ?[]const u8 {
     return nodeSubresource(target, "/workload-status");
+}
+
+fn allocationStatusNodeId(target: []const u8) ?[]const u8 {
+    return nodeSubresource(target, "/allocation-status");
 }
 
 fn nodeSubresource(target: []const u8, suffix: []const u8) ?[]const u8 {
@@ -424,7 +468,9 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
         1 => value.accelerator_inventory == null and value.features.len == 0,
         2 => value.features.len == 0 and validAcceleratorInventory(value.accelerator_inventory),
         heartbeat.current_schema_version => validFeatures(value.features) and
-            validAcceleratorInventory(value.accelerator_inventory),
+            validAcceleratorInventory(value.accelerator_inventory) and
+            (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
+                featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)),
         else => false,
     };
 }
@@ -455,6 +501,13 @@ fn validFeature(feature: []const u8) bool {
     return true;
 }
 
+fn featurePresent(features: []const []const u8, expected: []const u8) bool {
+    for (features) |feature| {
+        if (std.mem.eql(u8, feature, expected)) return true;
+    }
+    return false;
+}
+
 fn isAuthorized(request: *const std.http.Server.Request, token: ?[]const u8) bool {
     const required = token orelse return true;
     var iterator = request.iterateHeaders();
@@ -480,7 +533,8 @@ fn secureTokenEqual(provided: []const u8, expected: []const u8) bool {
 
 fn requiredToken(options: Options, target: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, target, "/v1/heartbeat") or
-        desiredStateNodeId(target) != null or statusNodeId(target) != null)
+        desiredStateNodeId(target) != null or statusNodeId(target) != null or
+        allocationStatusNodeId(target) != null)
         return options.token;
     return options.admin_token orelse options.token;
 }
@@ -635,6 +689,17 @@ test "heartbeat version three validates bounded unique features" {
     var unbounded = base;
     unbounded.features = &too_many;
     try std.testing.expect(!validHeartbeat(unbounded));
+
+    var lifecycle_without_requirements = base;
+    lifecycle_without_requirements.features = &.{heartbeat.feature_accelerator_lifecycle_v1};
+    try std.testing.expect(!validHeartbeat(lifecycle_without_requirements));
+
+    var lifecycle = base;
+    lifecycle.features = &.{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    try std.testing.expect(validHeartbeat(lifecycle));
 }
 
 test "node orchestration subresources reject nested identifiers" {
@@ -645,6 +710,10 @@ test "node orchestration subresources reject nested identifiers" {
     try std.testing.expectEqualStrings(
         "drone-07",
         statusNodeId("/v1/nodes/drone-07/workload-status").?,
+    );
+    try std.testing.expectEqualStrings(
+        "gpu-edge",
+        allocationStatusNodeId("/v1/nodes/gpu-edge/allocation-status").?,
     );
     try std.testing.expect(desiredStateNodeId("/v1/nodes/group/edge-01/desired-state") == null);
 }
