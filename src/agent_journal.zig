@@ -1,7 +1,7 @@
 const std = @import("std");
 const allocation = @import("allocation.zig");
 
-pub const schema_version: u16 = 1;
+pub const schema_version: u16 = 2;
 pub const max_journal_bytes: usize = 4 * 1024 * 1024;
 pub const max_operations: usize = 4096;
 pub const fingerprint_hex_bytes: usize = 64;
@@ -96,10 +96,28 @@ pub const Disposition = enum {
 /// both the retiring active handle and the newly created target handle.
 pub const Operation = struct {
     entry: allocation.JournalEntry,
+    /// Desired command revision retained even after release clears active
+    /// ownership fields before acknowledgement.
+    command_revision: u64,
     desired_fingerprint: []const u8,
+    /// Access identity carried by the retiring runtime, when this generation
+    /// replaces or releases a previously active instance.
+    active_access_fingerprint: ?[]const u8 = null,
+    /// Exact runtime operation identity carried across a control-plane
+    /// generation, including a local restart suffix when one is active.
+    active_operation_id: ?[]const u8 = null,
+    /// Access identity for the target runtime of this generation.
     access_fingerprint: []const u8,
     active_handle: ?RuntimeHandle = null,
     target_handle: ?RuntimeHandle = null,
+    /// A rollback restart is a third immutable runtime instance; it must not
+    /// overwrite either the retired active handle or the failed target.
+    restored_handle: ?RuntimeHandle = null,
+    /// Local restart attempts keep the control-plane generation fixed while
+    /// rotating the runtime operation identity and immutable handle.
+    restart_attempt: u32 = 0,
+    restart_pending: bool = false,
+    restart_handle: ?RuntimeHandle = null,
     /// Exact specs retained for adoption and rollback; never inferred from a
     /// newly fetched deployment after a crash.
     active_spec_json: ?[]const u8 = null,
@@ -134,6 +152,7 @@ pub const ValidationError = allocation.ValidationError || error{
     InvalidAcknowledgementTimestamp,
     InvalidDisposition,
     MissingRuntimeHandle,
+    InvalidCommandRevision,
 };
 
 pub const PutError = ValidationError || std.mem.Allocator.Error || error{
@@ -303,12 +322,22 @@ const SaveOptions = struct {
 
 pub fn validateOperation(operation: Operation) ValidationError!void {
     try allocation.validateJournal(operation.entry);
+    if (operation.command_revision == 0 or operation.command_revision > std.math.maxInt(i64))
+        return error.InvalidCommandRevision;
     if (!isFingerprint(operation.desired_fingerprint))
         return error.InvalidDesiredFingerprint;
+    if (operation.active_access_fingerprint) |fingerprint| {
+        if (!isFingerprint(fingerprint)) return error.InvalidAccessFingerprint;
+    }
+    if (operation.active_operation_id) |operation_id| {
+        if (!allocation.isSafeToken(operation_id)) return error.InvalidOperationId;
+    }
     if (!isFingerprint(operation.access_fingerprint))
         return error.InvalidAccessFingerprint;
     if (operation.active_handle) |handle| try handle.validate();
     if (operation.target_handle) |handle| try handle.validate();
+    if (operation.restored_handle) |handle| try handle.validate();
+    if (operation.restart_handle) |handle| try handle.validate();
     try validateOptionalSpec(operation.active_spec_json);
     try validateOptionalSpec(operation.target_spec_json);
     if (operation.recorded_unix_ms <= 0) return error.InvalidRecordedTimestamp;
@@ -339,7 +368,22 @@ pub fn validateOperation(operation: Operation) ValidationError!void {
         },
     }
 
-    if (operation.entry.action == .release and operation.target_handle != null)
+    if (operation.entry.action == .release and
+        (operation.target_handle != null or operation.restored_handle != null))
+        return error.InvalidDisposition;
+    if (operation.restored_handle != null and operation.entry.phase != .failed)
+        return error.InvalidDisposition;
+    if ((operation.restart_attempt != 0 or operation.restart_pending or
+        operation.restart_handle != null) and operation.entry.phase != .active)
+        return error.InvalidDisposition;
+    if (operation.restart_pending and operation.restart_attempt == 0)
+        return error.InvalidDisposition;
+    if (operation.restart_handle != null and operation.restart_attempt == 0)
+        return error.InvalidDisposition;
+    if (operation.restart_attempt != 0 and !operation.restart_pending and
+        operation.restart_handle == null)
+        return error.InvalidDisposition;
+    if (operation.active_handle != null and operation.active_operation_id == null)
         return error.InvalidDisposition;
     if (operation.entry.action == .run and operation.entry.phase == .active and
         operation.target_handle == null)
@@ -386,12 +430,20 @@ fn validateReplacement(previous: Operation, next: Operation) PutError!void {
         previous.access_fingerprint,
         next.access_fingerprint,
     )) return error.AccessFingerprintChanged;
+    try immutableOptionalString(
+        previous.active_access_fingerprint,
+        next.active_access_fingerprint,
+    );
+    try immutableOptionalString(previous.active_operation_id, next.active_operation_id);
     if (previous.entry.action != next.entry.action or
+        previous.command_revision != next.command_revision or
         previous.entry.target_revision != next.entry.target_revision or
         !stringListsEql(previous.entry.target_device_ids, next.entry.target_device_ids))
         return error.CommandChanged;
     try immutableOptionalHandle(previous.active_handle, next.active_handle);
     try immutableOptionalHandle(previous.target_handle, next.target_handle);
+    try immutableOptionalHandle(previous.restored_handle, next.restored_handle);
+    try validateRestartReplacement(previous, next);
     try immutableOptionalString(previous.active_spec_json, next.active_spec_json);
     try immutableOptionalString(previous.target_spec_json, next.target_spec_json);
     if (previous.entry.operation_id.len > 0 and
@@ -406,6 +458,27 @@ fn validateReplacement(previous: Operation, next: Operation) PutError!void {
     if (previous.entry.phase != next.entry.phase and
         !allocation.canTransition(previous.entry.phase, next.entry.phase))
         return error.InvalidPhaseTransition;
+}
+
+fn validateRestartReplacement(previous: Operation, next: Operation) PutError!void {
+    if (next.restart_attempt < previous.restart_attempt or
+        next.restart_attempt > previous.restart_attempt + 1)
+        return error.RuntimeHandleChanged;
+    if (next.restart_attempt == previous.restart_attempt + 1) {
+        if (previous.restart_pending or !next.restart_pending or
+            !optionalHandleEql(previous.restart_handle, next.restart_handle))
+            return error.RuntimeHandleChanged;
+        return;
+    }
+    if (previous.restart_pending and !next.restart_pending) return;
+    if (previous.restart_pending != next.restart_pending or
+        !optionalHandleEql(previous.restart_handle, next.restart_handle))
+        return error.RuntimeHandleChanged;
+}
+
+fn optionalHandleEql(previous: ?RuntimeHandle, next: ?RuntimeHandle) bool {
+    if (previous == null or next == null) return previous == null and next == null;
+    return RuntimeHandle.eql(previous.?, next.?);
 }
 
 fn immutableOptionalHandle(previous: ?RuntimeHandle, next: ?RuntimeHandle) PutError!void {
@@ -425,13 +498,32 @@ fn immutableOptionalString(previous: ?[]const u8, next: ?[]const u8) PutError!vo
 fn cloneOperation(allocator_: std.mem.Allocator, source: Operation) !Operation {
     return .{
         .entry = try cloneEntry(allocator_, source.entry),
+        .command_revision = source.command_revision,
         .desired_fingerprint = try allocator_.dupe(u8, source.desired_fingerprint),
+        .active_access_fingerprint = try cloneOptionalString(
+            allocator_,
+            source.active_access_fingerprint,
+        ),
+        .active_operation_id = try cloneOptionalString(
+            allocator_,
+            source.active_operation_id,
+        ),
         .access_fingerprint = try allocator_.dupe(u8, source.access_fingerprint),
         .active_handle = if (source.active_handle) |handle|
             try cloneHandle(allocator_, handle)
         else
             null,
         .target_handle = if (source.target_handle) |handle|
+            try cloneHandle(allocator_, handle)
+        else
+            null,
+        .restored_handle = if (source.restored_handle) |handle|
+            try cloneHandle(allocator_, handle)
+        else
+            null,
+        .restart_attempt = source.restart_attempt,
+        .restart_pending = source.restart_pending,
+        .restart_handle = if (source.restart_handle) |handle|
             try cloneHandle(allocator_, handle)
         else
             null,
@@ -546,6 +638,7 @@ fn activeContainerOperation() Operation {
             .active_device_ids = &.{"gpu:nvidia:01"},
             .target_device_ids = &.{"gpu:nvidia:01"},
         },
+        .command_revision = 7,
         .desired_fingerprint = "ab" ** 32,
         .access_fingerprint = "bc" ** 32,
         .target_handle = .{ .container = .{
@@ -618,6 +711,7 @@ test "atomic journal roundtrip retains release acknowledgement tombstone" {
         .phase = .released,
     };
     operation.active_handle = operation.target_handle;
+    operation.active_operation_id = "op-release";
     operation.target_handle = null;
     operation.disposition = .released_tombstone;
     operation.control_plane_ack_unix_ms = operation.recorded_unix_ms;

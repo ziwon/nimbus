@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const accelerator = @import("accelerator.zig");
 const heartbeat = @import("heartbeat.zig");
 const client = @import("client.zig");
@@ -57,7 +58,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
                     .node_id = options.node_id,
                     .token = options.token,
                     .runtime_options = options.runtime_options,
-                    .accelerator_inventory = inventory_report,
+                    .accelerator_inventory = &inventory,
                 }) catch |err| try log(init, "reconciliation failed: {t}\n", .{err});
             }
             if (options.once) return;
@@ -78,12 +79,16 @@ fn sendOnce(
     options: Options,
     inventory: accelerator.InventoryReport,
 ) !bool {
+    const features = advertisedFeatures(
+        options.orchestration_enabled,
+        options.runtime_options.enabled,
+    );
     const value = heartbeat.collect(
         init,
         options.node_id,
         options.role,
         options.labels,
-        &.{heartbeat.feature_accelerator_requirements_v1},
+        features,
         inventory,
     );
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
@@ -100,6 +105,20 @@ fn sendOnce(
     }
     try log(init, "heartbeat accepted for {s}\n", .{options.node_id});
     return true;
+}
+
+fn advertisedFeatures(
+    orchestration_enabled: bool,
+    enabled_runtimes: runtime.Enabled,
+) []const []const u8 {
+    return if (builtin.os.tag == .linux and
+        orchestration_enabled and enabled_runtimes.any())
+        &.{
+            heartbeat.feature_accelerator_requirements_v1,
+            heartbeat.feature_accelerator_lifecycle_v1,
+        }
+    else
+        &.{heartbeat.feature_accelerator_requirements_v1};
 }
 
 pub fn endpointAlloc(allocator: std.mem.Allocator, server: []const u8) ![]u8 {
@@ -135,4 +154,20 @@ test "heartbeat endpoint is derived from server URL" {
 test "retry backoff is capped" {
     try std.testing.expectEqual(@as(u64, 4), nextBackoff(2, 30));
     try std.testing.expectEqual(@as(u64, 30), nextBackoff(20, 30));
+}
+
+test "accelerator lifecycle capability is advertised only when executable" {
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        advertisedFeatures(false, .{ .process = true }).len,
+    );
+    const enabled = advertisedFeatures(true, .{ .process = true });
+    try std.testing.expectEqual(
+        @as(usize, if (builtin.os.tag == .linux) 2 else 1),
+        enabled.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        advertisedFeatures(true, .{}).len,
+    );
 }

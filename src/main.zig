@@ -2,6 +2,9 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 const accelerator = @import("accelerator.zig");
+const accelerator_agent = @import("accelerator_agent.zig");
+const accelerator_reconciler = @import("accelerator_reconciler.zig");
+const accelerator_runtime = @import("accelerator_runtime.zig");
 const allocation = @import("allocation.zig");
 const agent = @import("agent.zig");
 const agent_journal = @import("agent_journal.zig");
@@ -671,6 +674,9 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
 
 test {
     _ = accelerator;
+    _ = accelerator_agent;
+    _ = accelerator_reconciler;
+    _ = accelerator_runtime;
     _ = allocation;
     _ = agent;
     _ = agent_journal;

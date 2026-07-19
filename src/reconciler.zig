@@ -1,5 +1,7 @@
 const std = @import("std");
 const accelerator = @import("accelerator.zig");
+const accelerator_agent = @import("accelerator_agent.zig");
+const allocation = @import("allocation.zig");
 const client = @import("client.zig");
 const orchestration = @import("orchestration.zig");
 const reservation = @import("reservation.zig");
@@ -17,7 +19,7 @@ pub const Options = struct {
     node_id: []const u8,
     token: ?[]const u8,
     runtime_options: runtime.Options,
-    accelerator_inventory: accelerator.InventoryReport,
+    accelerator_inventory: *const accelerator.Inventory,
 };
 
 pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
@@ -45,7 +47,8 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         desired.value.accelerator_assignments,
     );
     defer desired_reservations.deinit();
-    if (!validDesiredReservations(desired.value, options.accelerator_inventory))
+    if (!validDesiredReservations(desired.value, options.accelerator_inventory.report()) or
+        !validDesiredAllocations(desired.value, options.accelerator_inventory.report()))
         return error.InvalidDesiredState;
 
     const state_path = try std.fmt.allocPrint(
@@ -72,6 +75,19 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         return error.UnsupportedLocalState;
     try reservation.validate(previous.accelerator_reservations);
 
+    for (desired.value.accelerator_allocations) |command| {
+        if (command.action != .run) continue;
+        if (findApplied(previous.applied, command.deployment) != null)
+            return error.LegacyRuntimeConflict;
+    }
+    try accelerator_agent.reconcileDesired(init, .{
+        .server = options.server,
+        .node_id = options.node_id,
+        .token = options.token,
+        .runtime_options = options.runtime_options,
+        .inventory = options.accelerator_inventory,
+    }, desired.value);
+
     var next: std.ArrayList(runtime.AppliedRecord) = .empty;
     defer next.deinit(init.gpa);
     var owned_specs: std.ArrayList([]u8) = .empty;
@@ -97,6 +113,10 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         }
 
         if (deployment.resources != null) {
+            if (findRunAllocation(
+                desired.value.accelerator_allocations,
+                deployment.name,
+            ) != null) continue;
             if (old) |record| try next.append(init.gpa, record);
             const block_reason = if (findAssignment(
                 desired.value.accelerator_assignments,
@@ -346,12 +366,88 @@ fn validDesiredReservations(
     return true;
 }
 
+fn validDesiredAllocations(
+    desired: orchestration.DesiredState,
+    inventory: accelerator.InventoryReport,
+) bool {
+    if (desired.accelerator_allocations.len > 0 and
+        desired.accelerator_assignments.len > 0)
+        return false;
+
+    for (desired.accelerator_allocations, 0..) |command, index| {
+        allocation.validateDesired(command) catch return false;
+        for (desired.accelerator_allocations[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.allocation_id, command.allocation_id) or
+                std.mem.eql(u8, previous.deployment, command.deployment))
+                return false;
+            const previous_ids = if (previous.action == .run)
+                previous.target_device_ids
+            else
+                previous.retiring_device_ids;
+            const current_ids = if (command.action == .run)
+                command.target_device_ids
+            else
+                command.retiring_device_ids;
+            for (previous_ids) |previous_id| {
+                for (current_ids) |current_id| {
+                    if (std.mem.eql(u8, previous_id, current_id)) return false;
+                }
+            }
+        }
+
+        if (command.action == .release) continue;
+        const deployment = findDeployment(
+            desired.deployments,
+            command.deployment,
+        ) orelse return false;
+        const resources = deployment.resources orelse return false;
+        if (deployment.desired != .running or
+            deployment.revision != command.revision or
+            resources.accelerators.count != command.target_device_ids.len)
+            return false;
+
+        for (command.target_device_ids) |device_id| {
+            var found = false;
+            for (inventory.accelerators) |device| {
+                if (!std.mem.eql(u8, device.id, device_id)) continue;
+                if (!accelerator.matchesRequirement(device, resources.accelerators))
+                    return false;
+                found = true;
+                break;
+            }
+            if (!found and inventory.status == .complete) return false;
+        }
+    }
+    return true;
+}
+
+fn findDeployment(
+    deployments: []const orchestration.Deployment,
+    name: []const u8,
+) ?orchestration.Deployment {
+    for (deployments) |deployment| {
+        if (std.mem.eql(u8, deployment.name, name)) return deployment;
+    }
+    return null;
+}
+
 fn findAssignment(
     assignments: []const orchestration.AcceleratorAssignment,
     deployment_name: []const u8,
 ) ?orchestration.AcceleratorAssignment {
     for (assignments) |assignment| {
         if (std.mem.eql(u8, assignment.deployment, deployment_name)) return assignment;
+    }
+    return null;
+}
+
+fn findRunAllocation(
+    allocations: []const allocation.DesiredAllocation,
+    deployment_name: []const u8,
+) ?allocation.DesiredAllocation {
+    for (allocations) |command| {
+        if (command.action == .run and
+            std.mem.eql(u8, command.deployment, deployment_name)) return command;
     }
     return null;
 }
@@ -448,4 +544,73 @@ test "desired accelerator assignments are verified against the heartbeat snapsho
     missing_device[0].device_ids = &.{"gpu:nvidia:missing"};
     invalid.accelerator_assignments = &missing_device;
     try std.testing.expect(!validDesiredReservations(invalid, inventory));
+}
+
+test "fenced allocation validation separates run and release trust boundaries" {
+    const devices = [_]accelerator.Device{.{
+        .id = "gpu:nvidia:a",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "L4",
+        .source = "fixture",
+        .capabilities = &.{"fp16"},
+    }};
+    const inventory: accelerator.InventoryReport = .{
+        .status = .complete,
+        .accelerators = &devices,
+        .probes = &.{},
+    };
+    const deployments = [_]orchestration.Deployment{.{
+        .name = "vision",
+        .revision = 3,
+        .runtime = .{ .kind = .docker, .reference = "example/vision@sha256:" ++ ("ab" ** 32) },
+        .resources = .{ .accelerators = .{
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .capabilities = &.{"fp16"},
+        } },
+        .targets = .{ .all = true },
+    }};
+    const run = [_]allocation.DesiredAllocation{.{
+        .allocation_id = "alloc-vision",
+        .generation = 1,
+        .deployment = "vision",
+        .revision = 3,
+        .action = .run,
+        .target_device_ids = &.{"gpu:nvidia:a"},
+    }};
+    const desired: orchestration.DesiredState = .{
+        .node_id = "edge-01",
+        .generation = 1,
+        .deployments = &deployments,
+        .accelerator_allocations = &run,
+    };
+    try std.testing.expect(validDesiredAllocations(desired, inventory));
+
+    var stale = run;
+    stale[0].revision = 2;
+    var invalid = desired;
+    invalid.accelerator_allocations = &stale;
+    try std.testing.expect(!validDesiredAllocations(invalid, inventory));
+
+    const release = [_]allocation.DesiredAllocation{.{
+        .allocation_id = "alloc-vision",
+        .generation = 2,
+        .deployment = "vision",
+        .revision = 3,
+        .action = .release,
+        .retiring_device_ids = &.{"gpu:nvidia:a"},
+    }};
+    const deleted: orchestration.DesiredState = .{
+        .node_id = "edge-01",
+        .generation = 2,
+        .deployments = &.{},
+        .accelerator_allocations = &release,
+    };
+    const unavailable: accelerator.InventoryReport = .{
+        .status = .unavailable,
+        .accelerators = &.{},
+        .probes = &.{},
+    };
+    try std.testing.expect(validDesiredAllocations(deleted, unavailable));
 }

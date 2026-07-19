@@ -152,9 +152,21 @@ pub fn healthCheck(
     deployment: orchestration.Deployment,
     record: AppliedRecord,
 ) !bool {
+    if (deployment.health_check.kind == .runtime)
+        return runtimeHealthy(init, record);
+    return applicationHealthCheck(init, deployment);
+}
+
+/// Run the deployment's application-level probe after a caller has already
+/// verified its own immutable runtime handle. A runtime-only check succeeds at
+/// this layer because exact process/container ownership is adapter-specific.
+pub fn applicationHealthCheck(
+    init: std.process.Init,
+    deployment: orchestration.Deployment,
+) !bool {
     const health = deployment.health_check;
     return switch (health.kind) {
-        .runtime => runtimeHealthy(init, record),
+        .runtime => true,
         .http => blk: {
             var buffer: [4096]u8 = undefined;
             const result = client.getJson(init, health.target.?, null, &buffer) catch break :blk false;
