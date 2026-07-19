@@ -1943,11 +1943,76 @@ pub const Registry = struct {
         defer prune.finalize();
         try prune.bindInt64(1, received_unix_ms -| workload_status_retention_ms);
         try prune.done();
+        if (command.action == .run) {
+            const workload_state: orchestration.ObservedState = switch (report.phase) {
+                .pending => .pending,
+                .active => .healthy,
+                .failed, .ambiguous => .failed,
+                else => .applying,
+            };
+            try self.recordAllocationWorkloadStatus(
+                report,
+                workload_state,
+                received_unix_ms,
+            );
+            if (workload_state == .failed) {
+                try self.handleUnavailable(report.deployment, received_unix_ms);
+            } else if (workload_state == .healthy) {
+                try self.maybeAdvanceRollout(report.deployment, received_unix_ms);
+            }
+        }
         if (report.phase == .released_ack_pending)
             try self.audit(received_unix_ms, report.node_id, "accelerator.released", report.deployment);
 
         try self.exec("COMMIT;");
         return true;
+    }
+
+    fn recordAllocationWorkloadStatus(
+        self: *Registry,
+        report: allocation.Status,
+        state: orchestration.ObservedState,
+        received_unix_ms: i64,
+    ) !void {
+        const message = if (report.message.len > 0) report.message else @tagName(report.phase);
+        var update = try self.prepare(
+            \\UPDATE workload_assignments
+            \\SET state=?, observed_revision=?, message=?, updated_unix_ms=?
+            \\WHERE deployment_name=? AND node_id=?;
+        );
+        defer update.finalize();
+        try update.bindText(1, @tagName(state));
+        try update.bindInt64(2, @intCast(report.revision));
+        try update.bindText(3, message);
+        try update.bindInt64(4, received_unix_ms);
+        try update.bindText(5, report.deployment);
+        try update.bindText(6, report.node_id);
+        try update.done();
+        if (c.sqlite3_changes(self.db) == 0)
+            return error.InconsistentLifecycleAssignment;
+
+        var history = try self.prepare(
+            \\INSERT INTO workload_status_history (
+            \\  deployment_name, node_id, revision, state, message,
+            \\  observed_unix_ms, received_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?);
+        );
+        defer history.finalize();
+        try history.bindText(1, report.deployment);
+        try history.bindText(2, report.node_id);
+        try history.bindInt64(3, @intCast(report.revision));
+        try history.bindText(4, @tagName(state));
+        try history.bindText(5, message);
+        try history.bindInt64(6, report.observed_unix_ms);
+        try history.bindInt64(7, received_unix_ms);
+        try history.done();
+
+        var prune = try self.prepare(
+            "DELETE FROM workload_status_history WHERE received_unix_ms < ?;",
+        );
+        defer prune.finalize();
+        try prune.bindInt64(1, received_unix_ms -| workload_status_retention_ms);
+        try prune.done();
     }
 
     fn insertTarget(self: *Registry, name: []const u8, kind: []const u8, value: []const u8) !void {
@@ -2954,6 +3019,18 @@ test "fenced accelerator claims survive deletion until central release acknowled
             run_status.observed_unix_ms,
         ));
     }
+
+    var rollout = try registry.prepare(
+        \\SELECT a.state, a.observed_revision, d.status
+        \\FROM workload_assignments a
+        \\JOIN deployments d ON d.name=a.deployment_name
+        \\WHERE a.deployment_name='vision' AND a.node_id='gpu-edge';
+    );
+    defer rollout.finalize();
+    try std.testing.expect(try rollout.row());
+    try std.testing.expectEqualStrings("healthy", rollout.columnText(0));
+    try std.testing.expectEqual(@as(i64, 1), rollout.columnInt64(1));
+    try std.testing.expectEqualStrings("completed", rollout.columnText(2));
 
     var active_claim = try registry.prepare(
         \\SELECT role, generation FROM accelerator_allocation_claims
