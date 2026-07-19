@@ -15,6 +15,7 @@ pub const FileConfig = struct {
     artifact_public_key: ?[]const u8 = null,
     require_artifact_signatures: ?bool = null,
     max_artifact_bytes: ?u64 = null,
+    artifact_cache_bytes: ?u64 = null,
     token: ?[]const u8 = null,
     token_file: ?[]const u8 = null,
     admin_token: ?[]const u8 = null,

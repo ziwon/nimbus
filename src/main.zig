@@ -6,6 +6,8 @@ const accelerator_agent = @import("accelerator_agent.zig");
 const accelerator_reconciler = @import("accelerator_reconciler.zig");
 const accelerator_runtime = @import("accelerator_runtime.zig");
 const allocation = @import("allocation.zig");
+const artifact_cache = @import("artifact_cache.zig");
+const artifact_selector = @import("artifact_selector.zig");
 const agent = @import("agent.zig");
 const agent_journal = @import("agent_journal.zig");
 const client = @import("client.zig");
@@ -37,6 +39,7 @@ const AgentOptions = struct {
     artifact_public_key_hex: ?[]const u8,
     require_artifact_signatures: bool,
     max_artifact_bytes: u64,
+    artifact_cache_bytes: u64,
     token: ?[]const u8,
     once: bool = false,
 };
@@ -150,6 +153,11 @@ fn defaultsForAgent(init: std.process.Init, file_config: config.FileConfig) !Age
             "NIMBUS_MAX_ARTIFACT_BYTES",
             file_config.max_artifact_bytes orelse 8 * 1024 * 1024 * 1024,
         ),
+        .artifact_cache_bytes = try config.envUnsigned(
+            init,
+            "NIMBUS_ARTIFACT_CACHE_BYTES",
+            file_config.artifact_cache_bytes orelse 16 * 1024 * 1024 * 1024,
+        ),
         .token = default_token,
     };
 }
@@ -197,6 +205,8 @@ fn parseAgentOptions(
             options.require_artifact_signatures = true;
         } else if (std.mem.eql(u8, arg, "--max-artifact-bytes")) {
             options.max_artifact_bytes = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
+        } else if (std.mem.eql(u8, arg, "--artifact-cache-bytes")) {
+            options.artifact_cache_bytes = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
         } else if (std.mem.eql(u8, arg, "--token")) {
             options.token = requireValue(init, args, &i, "--token");
         } else if (std.mem.eql(u8, arg, "--token-file")) {
@@ -218,6 +228,8 @@ fn parseAgentOptions(
     options.labels = labels.items;
     if (options.state_dir.len == 0) usageAndExit(init, "invalid state directory");
     if (options.max_artifact_bytes == 0) usageAndExit(init, "max artifact bytes must be positive");
+    if (options.artifact_cache_bytes < options.max_artifact_bytes)
+        usageAndExit(init, "artifact cache bytes must be at least max artifact bytes");
     if (options.orchestration_enabled and !options.enabled_runtimes.any())
         usageAndExit(init, "--orchestrate requires at least one --runtimes value");
     if (options.require_artifact_signatures and options.artifact_public_key_hex == null)
@@ -267,6 +279,7 @@ fn runAgent(
             .artifact_public_key_hex = options.artifact_public_key_hex,
             .require_artifact_signatures = options.require_artifact_signatures,
             .max_artifact_bytes = options.max_artifact_bytes,
+            .max_artifact_cache_bytes = options.artifact_cache_bytes,
         },
         .token = options.token,
         .once = options.once,
@@ -644,6 +657,7 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\                   [--label KEY=VALUE] [--orchestrate] [--runtimes CSV]
         \\                   [--state-dir PATH]
         \\                   [--artifact-public-key HEX] [--require-artifact-signatures]
+        \\                   [--max-artifact-bytes BYTES] [--artifact-cache-bytes BYTES]
         \\  nimbus server [--bind ADDRESS] [--port PORT] [--database PATH]
         \\                [--stale-after SEC] [--token TOKEN | --token-file PATH]
         \\                [--admin-token TOKEN | --admin-token-file PATH]
@@ -665,7 +679,8 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\NIMBUS_DATABASE, NIMBUS_BIND, NIMBUS_PORT, NIMBUS_STALE_AFTER_SECONDS,
         \\NIMBUS_ORCHESTRATION, NIMBUS_RUNTIMES, NIMBUS_STATE_DIR,
         \\NIMBUS_ARTIFACT_PUBLIC_KEY, NIMBUS_REQUIRE_ARTIFACT_SIGNATURES,
-        \\NIMBUS_MAX_ARTIFACT_BYTES, NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE,
+        \\NIMBUS_MAX_ARTIFACT_BYTES, NIMBUS_ARTIFACT_CACHE_BYTES,
+        \\NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE,
         \\and NIMBUS_ALLOW_INSECURE_NO_AUTH.
         \\
     ) catch {};
@@ -678,6 +693,8 @@ test {
     _ = accelerator_reconciler;
     _ = accelerator_runtime;
     _ = allocation;
+    _ = artifact_selector;
+    _ = artifact_cache;
     _ = agent;
     _ = agent_journal;
     _ = config;

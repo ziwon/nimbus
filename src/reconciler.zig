@@ -106,6 +106,17 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
                 };
                 continue;
             };
+            if (old != null)
+                runtime.releaseArtifactPin(
+                    init,
+                    options.runtime_options,
+                    deployment.name,
+                ) catch |err| {
+                    report(init, options, deployment, .failed, @errorName(err)) catch {
+                        status_delivery_failed = true;
+                    };
+                    continue;
+                };
             report(init, options, deployment, .stopped, "desired state is stopped") catch {
                 status_delivery_failed = true;
             };
@@ -165,6 +176,19 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
             }
         }
 
+        const preflight_path = runtime.preflightArtifact(
+            init,
+            deployment,
+            options.runtime_options,
+        ) catch |err| {
+            if (old) |record| try next.append(init.gpa, record);
+            report(init, options, deployment, .failed, @errorName(err)) catch {
+                status_delivery_failed = true;
+            };
+            continue;
+        };
+        defer if (preflight_path) |path| init.gpa.free(path);
+
         report(init, options, deployment, .applying, "applying desired revision") catch {
             status_delivery_failed = true;
         };
@@ -175,6 +199,17 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
             };
             continue;
         };
+        if (old != null)
+            runtime.releaseArtifactPin(
+                init,
+                options.runtime_options,
+                deployment.name,
+            ) catch |err| {
+                report(init, options, deployment, .failed, @errorName(err)) catch {
+                    status_delivery_failed = true;
+                };
+                continue;
+            };
 
         const applied = applyAndVerify(init, deployment, options.runtime_options, &owned_specs) catch |err| {
             if (old) |record| {
@@ -196,7 +231,9 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         if (desiredContains(desired.value.deployments, record.name)) continue;
         runtime.stop(init, record) catch {
             try next.append(init.gpa, record);
+            continue;
         };
+        runtime.releaseArtifactPin(init, options.runtime_options, record.name) catch {};
     }
 
     try saveState(init, state_path, .{
