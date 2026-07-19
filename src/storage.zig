@@ -1,4 +1,5 @@
 const std = @import("std");
+const accelerator = @import("accelerator.zig");
 const heartbeat = @import("heartbeat.zig");
 const orchestration = @import("orchestration.zig");
 const c = @cImport({
@@ -1127,6 +1128,66 @@ test "SQLite registry persists and marks nodes stale" {
     defer std.testing.allocator.free(nodes);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"node_id\":\"edge-01\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"status\":\"stale\"") != null);
+}
+
+test "version one and accelerator inventory heartbeats coexist" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+
+    const version_one: heartbeat.Heartbeat = .{
+        .schema_version = 1,
+        .node_id = "legacy-edge",
+        .hostname = "legacy-edge",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    const version_one_json = try heartbeat.serializeAlloc(std.testing.allocator, version_one);
+    defer std.testing.allocator.free(version_one_json);
+    try registry.recordHeartbeat(version_one, version_one_json, 1000);
+
+    const devices = [_]accelerator.Device{.{
+        .id = "gpu:nvidia:7f3c",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "Jetson-Orin",
+        .source = "fixture",
+        .memory_total_bytes = 8 * 1024 * 1024 * 1024,
+        .capabilities = &.{ "fp16", "int8" },
+    }};
+    const probes = [_]accelerator.ProbeOutcome{.{
+        .name = "fixture",
+        .status = .ok,
+        .devices_found = 1,
+    }};
+    const version_two: heartbeat.Heartbeat = .{
+        .node_id = "accelerated-edge",
+        .hostname = "accelerated-edge",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 8 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &devices,
+            .probes = &probes,
+        },
+        .timestamp_unix_ms = 2000,
+    };
+    const version_two_json = try heartbeat.serializeAlloc(std.testing.allocator, version_two);
+    defer std.testing.allocator.free(version_two_json);
+    try registry.recordHeartbeat(version_two, version_two_json, 2000);
+
+    const legacy = (try registry.inspectNode("legacy-edge", 2000, 3000)).?;
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "\"schema_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "gpu:nvidia") == null);
+
+    const accelerated = (try registry.inspectNode("accelerated-edge", 2000, 3000)).?;
+    defer std.testing.allocator.free(accelerated);
+    try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"schema_version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"gpu:nvidia:7f3c\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"status\":\"complete\"") != null);
 }
 
 test "heartbeat history is sampled and enrollment audit is not duplicated" {

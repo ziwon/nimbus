@@ -139,11 +139,13 @@ api-check port="18083" token="api-check-token": build
     test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/nodes")" = 401
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:$port/v1/nodes")" = 401
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data '{"schema_version":9}' "http://127.0.0.1:$port/v1/heartbeat")" = 400
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data '{"schema_version":1,"node_id":"api-legacy","hostname":"api-legacy","role":"edge","platform":{"os":"linux","arch":"x86_64","abi":"gnu"},"resources":{"cpu_count":2},"timestamp_unix_ms":1000}' "http://127.0.0.1:$port/v1/heartbeat")" = 202
     head -c 70000 /dev/zero | tr '\000' x > "$oversized"
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data-binary "@$oversized" "http://127.0.0.1:$port/v1/heartbeat")" = 413
 
     ./zig-out/bin/nimbus agent run --once --id api-edge --server "http://127.0.0.1:$port"
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge" | grep -q '"accelerator_inventory"'
     kill "$server_pid"
     wait "$server_pid"
     server_pid=""
@@ -157,6 +159,7 @@ api-check port="18083" token="api-check-token": build
     done
     test "$ready" = true
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-legacy")" = 200
 
 # Run native end-to-end checks.
 integration: demo api-check orchestration-demo

@@ -1,15 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const accelerator = @import("accelerator.zig");
+
+pub const current_schema_version: u8 = 2;
 
 pub const Heartbeat = struct {
-    schema_version: u8 = 1,
+    schema_version: u8 = current_schema_version,
     node_id: []const u8,
     hostname: []const u8,
     role: []const u8,
     labels: []const Label = &.{},
     platform: Platform,
     resources: Resources,
+    accelerator_inventory: ?accelerator.InventoryReport = null,
     timestamp_unix_ms: i64,
     agent_version: []const u8 = build_options.version,
 };
@@ -34,6 +38,7 @@ pub fn collect(
     node_id: []const u8,
     role: []const u8,
     labels: []const Label,
+    accelerator_inventory: accelerator.InventoryReport,
 ) Heartbeat {
     const hostname = detectHostname(init);
 
@@ -50,6 +55,7 @@ pub fn collect(
         .resources = .{
             .cpu_count = std.Thread.getCpuCount() catch 0,
         },
+        .accelerator_inventory = accelerator_inventory,
         .timestamp_unix_ms = std.Io.Clock.real.now(init.io).toMilliseconds(),
     };
 }
@@ -78,6 +84,15 @@ test "heartbeat JSON contains portable target metadata" {
         .role = "edge",
         .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
         .resources = .{ .cpu_count = 4 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &.{},
+            .probes = &.{.{
+                .name = "nvidia-smi",
+                .status = .not_present,
+                .devices_found = 0,
+            }},
+        },
         .timestamp_unix_ms = 1_700_000_000_000,
     };
 
@@ -86,4 +101,5 @@ test "heartbeat JSON contains portable target metadata" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"node_id\":\"edge-01\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"arch\":\"aarch64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"accelerator_inventory\"") != null);
 }

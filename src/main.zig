@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
+const accelerator = @import("accelerator.zig");
 const agent = @import("agent.zig");
 const client = @import("client.zig");
 const config = @import("config.zig");
@@ -219,7 +220,9 @@ fn parseAgentOptions(
 fn inspectAgent(init: std.process.Init, file_config: config.FileConfig, args: []const []const u8) !void {
     const options = try parseAgentOptions(init, file_config, args);
     const node_id = options.node_id orelse try identity.loadOrCreate(init, options.node_id_file);
-    const value = heartbeat.collect(init, node_id, options.role, options.labels);
+    var inventory = try accelerator.collectSystem(init.gpa, init.io);
+    defer inventory.deinit();
+    const value = heartbeat.collect(init, node_id, options.role, options.labels, inventory.report());
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);
     try Io.File.stdout().writeStreamingAll(init.io, payload);
@@ -655,6 +658,7 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
 }
 
 test {
+    _ = accelerator;
     _ = agent;
     _ = config;
     _ = heartbeat;

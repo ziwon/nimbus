@@ -1,4 +1,5 @@
 const std = @import("std");
+const accelerator = @import("accelerator.zig");
 const heartbeat = @import("heartbeat.zig");
 const client = @import("client.zig");
 const reconciler = @import("reconciler.zig");
@@ -62,7 +63,15 @@ pub fn run(init: std.process.Init, options: Options) !void {
 }
 
 fn sendOnce(init: std.process.Init, endpoint: []const u8, options: Options) !bool {
-    const value = heartbeat.collect(init, options.node_id, options.role, options.labels);
+    var inventory = try accelerator.collectSystem(init.gpa, init.io);
+    defer inventory.deinit();
+    const value = heartbeat.collect(
+        init,
+        options.node_id,
+        options.role,
+        options.labels,
+        inventory.report(),
+    );
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);
 

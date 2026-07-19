@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const accelerator = @import("accelerator.zig");
 const heartbeat = @import("heartbeat.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
@@ -402,8 +403,7 @@ fn ingestHeartbeat(
 }
 
 fn validHeartbeat(value: heartbeat.Heartbeat) bool {
-    if (!(value.schema_version == 1 and
-        identity.isValid(value.node_id) and
+    if (!(identity.isValid(value.node_id) and
         value.hostname.len > 0 and value.hostname.len <= 255 and
         value.role.len > 0 and value.role.len <= 64 and
         value.platform.os.len > 0 and value.platform.os.len <= 32 and
@@ -418,7 +418,14 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
             if (std.mem.eql(u8, previous.key, label.key)) return false;
         }
     }
-    return true;
+    return switch (value.schema_version) {
+        1 => value.accelerator_inventory == null,
+        heartbeat.current_schema_version => if (value.accelerator_inventory) |inventory|
+            accelerator.validateReport(inventory)
+        else
+            false,
+        else => false,
+    };
 }
 
 fn isAuthorized(request: *const std.http.Server.Request, token: ?[]const u8) bool {
@@ -465,7 +472,7 @@ fn respondJson(request: *std.http.Server.Request, body: []const u8, status: std.
 
 test "heartbeat validation rejects unsupported schemas" {
     const value: heartbeat.Heartbeat = .{
-        .schema_version = 2,
+        .schema_version = 3,
         .node_id = "edge-01",
         .hostname = "edge-01",
         .role = "edge",
@@ -474,6 +481,65 @@ test "heartbeat validation rejects unsupported schemas" {
         .timestamp_unix_ms = 1000,
     };
     try std.testing.expect(!validHeartbeat(value));
+}
+
+test "heartbeat validation accepts version one during rolling upgrades" {
+    const value: heartbeat.Heartbeat = .{
+        .schema_version = 1,
+        .node_id = "edge-v1",
+        .hostname = "edge-v1",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    try std.testing.expect(validHeartbeat(value));
+}
+
+test "heartbeat validation requires inventory in version two" {
+    const value: heartbeat.Heartbeat = .{
+        .node_id = "edge-v2",
+        .hostname = "edge-v2",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    try std.testing.expect(!validHeartbeat(value));
+}
+
+test "heartbeat validation distinguishes CPU-only from unavailable inventory" {
+    const base: heartbeat.Heartbeat = .{
+        .node_id = "edge-v2",
+        .hostname = "edge-v2",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &.{},
+            .probes = &.{.{
+                .name = "nvidia-smi",
+                .status = .not_present,
+                .devices_found = 0,
+            }},
+        },
+        .timestamp_unix_ms = 1000,
+    };
+    try std.testing.expect(validHeartbeat(base));
+
+    var unavailable = base;
+    unavailable.accelerator_inventory = .{
+        .status = .unavailable,
+        .accelerators = &.{},
+        .probes = &.{.{
+            .name = "nvidia-smi",
+            .status = .failed,
+            .devices_found = 0,
+            .error_name = "ProviderCommandFailed",
+        }},
+    };
+    try std.testing.expect(validHeartbeat(unavailable));
 }
 
 test "node orchestration subresources reject nested identifiers" {
