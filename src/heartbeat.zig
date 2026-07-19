@@ -8,6 +8,7 @@ pub const max_feature_count: usize = 16;
 pub const max_feature_name_length: usize = 64;
 pub const feature_accelerator_requirements_v1 = "accelerator-requirements-v1";
 pub const feature_accelerator_lifecycle_v1 = "accelerator-lifecycle-v1";
+pub const feature_artifact_variants_v1 = "artifact-variants-v1";
 
 pub const Heartbeat = struct {
     schema_version: u8 = current_schema_version,

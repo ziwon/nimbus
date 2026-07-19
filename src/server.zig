@@ -470,7 +470,9 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
         heartbeat.current_schema_version => validFeatures(value.features) and
             validAcceleratorInventory(value.accelerator_inventory) and
             (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
-                featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)),
+                featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
+            (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
+                featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)),
         else => false,
     };
 }

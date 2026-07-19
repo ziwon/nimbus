@@ -53,8 +53,28 @@ pub const Artifact = struct {
     /// `file://` and `http://` are supported by the bootstrap transport.
     source: []const u8,
     sha256: []const u8,
-    /// Hex-encoded Ed25519 signature over the lowercase SHA-256 string.
+    /// Hex-encoded Ed25519 signature. A single artifact signs its lowercase
+    /// digest; a named variant signs the domain-separated variant descriptor.
     signature_ed25519: ?[]const u8 = null,
+};
+
+pub const ArtifactSelector = struct {
+    os: ?[]const u8 = null,
+    arch: ?[]const u8 = null,
+    abi: ?[]const u8 = null,
+    accelerator_kind: ?accelerator.Kind = null,
+    accelerator_vendor: ?[]const u8 = null,
+    accelerator_model: ?[]const u8 = null,
+    accelerator_capabilities: []const []const u8 = &.{},
+};
+
+pub const ArtifactVariant = struct {
+    name: []const u8,
+    artifact: Artifact,
+    selector: ArtifactSelector = .{},
+    /// A fallback participates only when no compatible primary variant exists.
+    /// Integrity or signature failure never triggers a downgrade.
+    fallback: bool = false,
 };
 
 pub const HealthCheck = struct {
@@ -97,6 +117,9 @@ pub const Deployment = struct {
     desired: DesiredStatus = .running,
     runtime: RuntimeSpec,
     artifact: ?Artifact = null,
+    /// Omitted on the wire unless a deployment opts into artifact variants.
+    /// This preserves strict-parser compatibility with pre-A4 agents.
+    artifact_variants: ?[]const ArtifactVariant = null,
     health_check: HealthCheck = .{},
     restart_policy: RestartPolicy = .always,
     resources: ?Resources = null,
@@ -135,13 +158,24 @@ pub fn validateDeployment(value: Deployment) bool {
         value.revision == 0 or value.revision > std.math.maxInt(i64))
         return false;
     if (!validTargets(value.targets) or !validRollout(value.rollout)) return false;
-    if (!validRuntime(value.runtime, value.artifact != null)) return false;
+    const variants = value.artifact_variants orelse &.{};
+    if (value.artifact != null and variants.len != 0) return false;
+    if (variants.len > 32) return false;
+    const has_artifact = value.artifact != null or variants.len != 0;
+    if (!validRuntime(value.runtime, has_artifact)) return false;
     if (!validHealth(value.health_check)) return false;
     if (value.resources) |resources| {
         if (!accelerator.validateRequirement(resources.accelerators)) return false;
     }
     if (value.artifact) |artifact| {
         if (!validArtifact(artifact)) return false;
+    }
+    for (variants, 0..) |variant, index| {
+        if (!isName(variant.name) or !validArtifact(variant.artifact) or
+            !validArtifactSelector(variant.selector)) return false;
+        for (variants[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.name, variant.name)) return false;
+        }
     }
     return true;
 }
@@ -265,6 +299,38 @@ fn validArtifact(artifact: Artifact) bool {
     if (artifact.signature_ed25519) |signature| {
         if (signature.len != 128) return false;
         for (signature) |byte| if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn validArtifactSelector(selector: ArtifactSelector) bool {
+    if (selector.os) |value| if (!isSelectorValue(value)) return false;
+    if (selector.arch) |value| if (!isSelectorValue(value)) return false;
+    if (selector.abi) |value| if (!isSelectorValue(value)) return false;
+    if (selector.accelerator_vendor) |value| if (!isSelectorValue(value)) return false;
+    if (selector.accelerator_model) |value| if (!isSelectorValue(value)) return false;
+    if (selector.accelerator_capabilities.len > 32) return false;
+    for (selector.accelerator_capabilities, 0..) |capability, index| {
+        if (!isSelectorValue(capability)) return false;
+        for (selector.accelerator_capabilities[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, capability)) return false;
+        }
+        if (index > 0 and
+            std.mem.order(u8, selector.accelerator_capabilities[index - 1], capability) != .lt)
+            return false;
+    }
+    if ((selector.accelerator_vendor != null or
+        selector.accelerator_model != null or
+        selector.accelerator_capabilities.len != 0) and
+        selector.accelerator_kind == null) return false;
+    return true;
+}
+
+fn isSelectorValue(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        if (byte < 0x21 or byte > 0x7e or byte == '"' or byte == '\\' or byte == 0)
+            return false;
     }
     return true;
 }

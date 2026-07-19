@@ -111,7 +111,14 @@ fn advertisedFeatures(
     orchestration_enabled: bool,
     enabled_runtimes: runtime.Enabled,
 ) []const []const u8 {
-    return if (builtin.os.tag == .linux and
+    return if (builtin.os.tag == .linux and orchestration_enabled and
+        enabled_runtimes.process)
+        &.{
+            heartbeat.feature_accelerator_requirements_v1,
+            heartbeat.feature_accelerator_lifecycle_v1,
+            heartbeat.feature_artifact_variants_v1,
+        }
+    else if (builtin.os.tag == .linux and
         orchestration_enabled and enabled_runtimes.any())
         &.{
             heartbeat.feature_accelerator_requirements_v1,
@@ -163,9 +170,14 @@ test "accelerator lifecycle capability is advertised only when executable" {
     );
     const enabled = advertisedFeatures(true, .{ .process = true });
     try std.testing.expectEqual(
-        @as(usize, if (builtin.os.tag == .linux) 2 else 1),
+        @as(usize, if (builtin.os.tag == .linux) 3 else 1),
         enabled.len,
     );
+    if (builtin.os.tag == .linux)
+        try std.testing.expectEqualStrings(
+            heartbeat.feature_artifact_variants_v1,
+            enabled[2],
+        );
     try std.testing.expectEqual(
         @as(usize, 1),
         advertisedFeatures(true, .{}).len,
