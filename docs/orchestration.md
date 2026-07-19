@@ -8,9 +8,10 @@ servers, and cloud hosts. The goal is operational continuity on heterogeneous
 fleets without requiring every device to run a Kubernetes node stack.
 
 The implementation includes runtime control, reconciliation, health checks,
-staged rollout, rollback, artifact integrity, and status history. It is not a
-general container scheduler: it does not place workloads from resource
-requests, provide a service network, attach distributed storage, or implement
+staged rollout, rollback, artifact integrity, status history, and exclusive
+accelerator reservation within explicitly targeted nodes. It is not a general
+container scheduler: it does not choose nodes from an unspecified resource
+pool, provide a service network, attach distributed storage, or implement
 Kubernetes API compatibility.
 
 ## Topology model
@@ -73,6 +74,15 @@ labels and rolls out ten nodes at a time:
     "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "signature_ed25519": null
   },
+  "resources": {
+    "accelerators": {
+      "count": 1,
+      "kind": "gpu",
+      "vendor": "nvidia",
+      "memory_min_bytes": 4294967296,
+      "capabilities": ["fp16"]
+    }
+  },
   "health_check": {
     "kind": "http",
     "target": "http://127.0.0.1:9000/healthz",
@@ -128,6 +138,36 @@ revision, even if the node is relabeled during rollout. This keeps a wave from
 losing a member and stalling. New deployments and newly applied revisions use
 the latest role and labels when rebuilding assignments.
 
+## Accelerator requirements and reservations
+
+`resources.accelerators` declares a positive `count`, a required accelerator
+`kind`, and optional `vendor`, minimum total memory, and capability strings.
+The declaration describes hardware compatibility; labels continue to describe
+operator intent such as site or device class.
+
+A heartbeat v3 agent advertises `accelerator-requirements-v1`. For each matching
+node, the control plane filters the normalized inventory, excludes IDs reserved
+by other deployments, sorts compatible IDs lexically, and reserves the required
+count atomically. The database uniqueness key is `(node_id, accelerator_id)`, so
+two workloads cannot own one exclusive device. The assignment is also persisted
+in the agent's canonical `applied.json` ledger and recovered after restart.
+
+New placement fails closed unless inventory is `complete`. An existing
+compatible reservation is retained when a later inventory is `partial` or
+`unavailable`; only a `complete` report can confirm that the assigned device is
+missing or incompatible. Deployment inspection exposes reservations and
+machine-readable placement reasons such as `agent_feature_unsupported`,
+`no_accelerator`, `accelerator_memory_insufficient`,
+`accelerator_capability_missing`, and `accelerator_capacity_exhausted`.
+
+This A2 reservation is logical ownership, not device access. Until A3 adds CDI
+and host-device injection, the agent preserves any existing applied workload
+and reports `accelerator_assignment_unavailable` when placement is blocked. If
+an assignment is ready, it validates and saves the assignment but reports
+`runtime_device_injection_unavailable`. In both cases it does not start the
+accelerator workload. Do not treat the current reservation as production GPU or
+DLA isolation.
+
 ## Runtime adapters
 
 ### Process
@@ -155,24 +195,26 @@ rejected. Docker uses `docker`, while the containerd adapter uses `nerdctl` in
 the `nimbus` namespace. Both create a deterministic `nimbus-NAME` container and
 translate the desired restart policy.
 
-Nimbus currently supports image, command, and restart policy. It does not yet
-model ports, mounts, devices, GPU requests, networks, secrets, or resource
-limits in the deployment schema.
+Nimbus currently supports image, command, restart policy, and accelerator
+requirements. It does not yet inject CDI/device access or model ports, mounts,
+networks, secrets, or general resource limits in the deployment schema.
 
 ## Reconciliation
 
 After every successful heartbeat, an orchestration-enabled agent:
 
 1. Fetches its desired-state document.
-2. Strictly validates the schema and every deployment.
-3. Loads its atomically stored applied-state record.
-4. Stops workloads absent from desired state or marked `stopped`.
-5. Keeps a matching healthy revision unchanged.
-6. Restarts an unhealthy workload unless restart policy is `never`.
-7. Stops the old revision, prepares the new artifact, and applies the runtime.
-8. Runs the configured health check up to `failure_threshold` times.
-9. Restores the previous local specification if the new apply fails.
-10. Reports observed state and atomically saves the new local state.
+2. Strictly validates every deployment and accelerator assignment.
+3. Validates assignments against the same inventory snapshot as the heartbeat.
+4. Loads its atomically stored applied state and accelerator ledger.
+5. Stops workloads absent from desired state or marked `stopped`.
+6. Blocks accelerator workloads before runtime execution until A3 is available.
+7. Keeps a matching healthy CPU revision unchanged.
+8. Restarts an unhealthy CPU workload unless restart policy is `never`.
+9. Stops the old revision, prepares the new artifact, and applies the runtime.
+10. Runs the configured health check up to `failure_threshold` times.
+11. Restores the previous local specification if the new apply fails.
+12. Reports observed state and atomically saves both local records.
 
 Observed states are `pending`, `applying`, `healthy`, `degraded`, `failed`,
 `stopped`, and `blocked`. A runtime outside the agent allowlist reports
@@ -256,8 +298,9 @@ nimbus deployments delete NAME
 nimbus deployments rollback NAME
 ```
 
-`inspect` returns rollout configuration, the canonical specification, and each
-node assignment with wave, observed revision, state, message, and update time.
+`inspect` returns rollout configuration, the canonical specification, placement
+decisions and reservations, and each node assignment with wave, observed
+revision, state, message, and update time.
 Workload status history is retained in SQLite for 30 days for future querying
 but does not yet have a dedicated CLI endpoint. Heartbeat history is separately
 sampled and retained for seven days.

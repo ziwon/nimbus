@@ -23,6 +23,7 @@ Nimbus currently provides:
 - stable node identity, roles, and labels;
 - periodic heartbeat, platform inventory, and online/stale state;
 - bounded NVIDIA and Jetson accelerator inventory with opaque device IDs;
+- declarative accelerator requirements and exclusive logical reservations;
 - desired-state storage and agent-side reconciliation;
 - process, systemd, Docker, and containerd/nerdctl adapters behind an allowlist;
 - runtime, HTTP, TCP, and direct-command health checks;
@@ -33,9 +34,10 @@ Nimbus currently provides:
 - separate node/operator bearer tokens when configured;
 - static Linux and native Windows/macOS cross-builds.
 
-Resource-aware scheduling, service discovery, overlay networking, distributed
-storage, secrets delivery, accelerator allocation, high-availability control
-planes, and per-node cryptographic identity are outside the current implementation.
+Pool-wide resource scheduling, service discovery, overlay networking,
+distributed storage, secrets delivery, runtime accelerator injection,
+high-availability control planes, and per-node cryptographic identity are
+outside the current implementation.
 
 ## Why Zig
 
@@ -102,6 +104,7 @@ flowchart TB
     Accelerator[accelerator.zig<br/>bounded hardware probes]
     Agent[agent.zig<br/>lifecycle and retry]
     Reconcile[reconciler.zig<br/>desired/current diff]
+    Reservation[reservation.zig<br/>local accelerator ownership]
     Runtime[runtime.zig<br/>adapters and artifacts]
     Protocol[orchestration.zig<br/>schema and validation]
     Client[client.zig<br/>HTTP client]
@@ -119,6 +122,7 @@ flowchart TB
     Agent --> Client
     Agent --> Shutdown
     Reconcile --> Protocol
+    Reconcile --> Reservation
     Reconcile --> Runtime
     Reconcile --> Client
     Server --> Protocol
@@ -136,6 +140,7 @@ flowchart TB
 | `agent.zig` | Heartbeat/reconcile loop, jitter, retry, and one-shot behavior |
 | `orchestration.zig` | Desired-state types and trust-boundary validation |
 | `reconciler.zig` | Local diff, apply/stop/restart, health, restore, and status |
+| `reservation.zig` | Canonical, fail-closed local accelerator reservation ledger |
 | `runtime.zig` | Runtime adapters, artifact streaming, digest/signature checks |
 | `client.zig` | Authenticated JSON HTTP requests |
 | `server.zig` | Concurrent connection handling, routing, auth, and body limits |
@@ -165,15 +170,16 @@ without interpretation.
 
 The agent sends a schema-versioned heartbeat containing node ID, hostname,
 role, labels, compiled OS/architecture/ABI, CPU count, accelerator inventory,
-version, and timestamp. Heartbeat v2 distinguishes a trustworthy empty
-`complete` inventory from `partial` or `unavailable` probe results. NVIDIA UUIDs
-are converted to node-scoped opaque hashes; Jetson GPU and DLA identities use
-stable functional slots.
+features, version, and timestamp. Heartbeat v2 introduced the distinction
+between a trustworthy empty `complete` inventory and `partial` or `unavailable`
+probe results. NVIDIA UUIDs are converted to node-scoped opaque hashes; Jetson
+GPU and DLA identities use stable functional slots.
 
-The server accepts heartbeat versions 1 and 2 during rolling upgrades. Version
-1 means accelerator inventory was not reported, while version 2 requires a
-bounded and internally consistent inventory. Servers must be upgraded before
-agents because a version 1 server rejects version 2 heartbeats.
+The server accepts heartbeat versions 1, 2, and 3 during rolling upgrades.
+Version 1 has no accelerator inventory, version 2 requires a bounded and
+internally consistent inventory, and version 3 also carries negotiated feature
+names. Current agents emit v3 with `accelerator-requirements-v1`. Servers must
+be upgraded before agents because older servers reject newer heartbeat schemas.
 The server stores both agent time and server receipt time. Online/stale state is
 derived from receipt time, avoiding trust in device clock accuracy.
 
@@ -188,8 +194,8 @@ sequenceDiagram
     A->>C: POST heartbeat
     C-->>A: 202 accepted
     A->>C: GET node desired-state
-    C-->>A: current-wave deployments
-    A->>A: Validate and diff applied.json
+    C-->>A: current-wave deployments and accelerator assignments
+    A->>A: Validate assignments and diff applied.json
     A->>R: Stop/apply/restart
     A->>R: Health check
     A->>C: POST observed workload status
@@ -203,6 +209,14 @@ returns, the next pass converges local state.
 The runtime allowlist is agent policy, not desired state. A control-plane
 deployment cannot enable an adapter disabled on a node. Commands are argv
 arrays and never pass through a shell.
+
+For an accelerator requirement, the control plane selects compatible IDs in a
+stable order and stores an exclusive logical reservation. The agent validates
+the assignment against the inventory snapshot sent in the preceding heartbeat
+and atomically persists a canonical local ledger. Until runtime device injection
+is implemented in A3, it reports `accelerator_assignment_unavailable` when no
+compatible reservation is ready or `runtime_device_injection_unavailable` when
+one is ready, without starting or replacing the workload.
 
 ## Desired-state and rollout model
 
@@ -268,9 +282,9 @@ second busy timeout. The schema includes:
 
 | Table group | Tables |
 |---|---|
-| Node state | `nodes`, `node_labels`, `heartbeat_history` |
+| Node state | `nodes`, `node_labels`, `heartbeat_history`, `node_features`, `node_accelerator_inventory`, `node_accelerators`, `node_accelerator_capabilities` |
 | Desired state | `deployments`, `deployment_targets`, `deployment_label_targets` |
-| Observed state | `workload_assignments`, `workload_status_history` |
+| Observed state | `workload_assignments`, `workload_status_history`, `accelerator_reservations`, `placement_decisions` |
 | Operations | `audit_events`, `schema_migrations` |
 
 Heartbeat, deployment apply, desired-state assignment, status transition, and
@@ -280,10 +294,11 @@ concurrently through `std.Io.Group`, bounded to 64 active handlers with a
 shared SQLite connection and protects multi-statement transactions. Current node
 state is updated on every heartbeat; history is sampled every five minutes and
 retained for seven days. Audit events and workload status history are retained
-for 30 days. A1 accelerator inventory remains inside the canonical
-`report_json`, so node inspection preserves v1 and v2 reports without a schema
-migration. Queryable accelerator and last-known tables are deferred until A2
-scheduling semantics require them.
+for 30 days. The canonical heartbeat JSON remains available for exact node
+inspection, while A2 also normalizes feature and accelerator claims for
+selection. Current device rows are replaced by each heartbeat, but logical
+reservations remain independent so a partial probe or disappearance does not
+silently transfer ownership to another workload.
 
 This architecture handles overlapping edge requests without claiming
 horizontal control-plane scale. One server process and one database remain the
@@ -316,8 +331,11 @@ shared node token allows node impersonation by another token holder.
 
 - One SQLite control plane; no replication, leader election, or failover.
 - No rollout deadline or automatic skip for an offline current-wave node.
-- No resource-aware placement or capacity admission.
-- No ports, mounts, devices, GPU, network, secret, or resource-limit schema.
+- No pool-wide or dynamic resource placement; A2 allocates only within explicit
+  node, role, and label targets.
+- Accelerator requirements exist, but runtime device/CDI injection is not yet
+  implemented. Accelerator deployments are blocked before execution.
+- No ports, mounts, network, secret, or general resource-limit schema.
 - No offline deadline/lease that stops workloads after prolonged disconnection.
 - Process runtime is Linux-only and intentionally smaller than systemd.
 - HTTP-only embedded server, process artifact downloads, and runtime health URLs.

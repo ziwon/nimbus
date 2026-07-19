@@ -42,7 +42,8 @@ the system is shaped this way. Workload orchestration defines current operator
 semantics and production boundaries. Development documents repository-specific
 Zig practices and change workflows.
 
-The docs describe implemented behavior, including desired-state reconciliation
-and runtime deployment. Future GPU/resource scheduling, secrets, high
+The docs describe implemented behavior, including desired-state reconciliation,
+runtime deployment, accelerator inventory, and logical reservation. Future
+runtime device injection, dynamic resource placement, secrets, high
 availability, and per-node identity should be documented as current behavior
 only after their code and tests exist.

@@ -12,6 +12,7 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - interval, jitter, exponential retry, and graceful POSIX shutdown;
 - labels and roles for targeting glasses, drones, vehicles, desktops, and servers;
 - bounded NVIDIA and Jetson accelerator discovery with opaque stable IDs;
+- declarative accelerator requirements with exclusive logical reservations;
 - a versioned desired-state and reconciliation loop;
 - opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
 - batched rollout, health gates, status history, and automatic rollback;
@@ -190,9 +191,10 @@ POST /v1/deployments/{name}/rollback
 and returns `{ "items": [...], "next_after": "..." | null }`.
 
 Heartbeats are schema-versioned and validated before they are written. The
-server accepts legacy v1 reports and v2 reports with a required accelerator
-inventory; new agents emit v2. Upgrade the server before agents during a rolling
-deployment. CPU-only discovery is distinct from a failed or unavailable probe.
+server accepts legacy v1 reports, v2 reports with a required accelerator
+inventory, and v3 reports with bounded feature negotiation; current agents emit
+v3. Upgrade the server before agents during a rolling deployment. CPU-only
+discovery is distinct from a failed or unavailable probe.
 SQLite always updates current node state, samples heartbeat history at most
 every five minutes per node, retains it for seven days, and retains audit events
 for 30 days. Enrollment is audited once instead of auditing every accepted
@@ -234,6 +236,12 @@ deterministic node order, bounded batch size, health-gated waves, an optional
 pause, and an unavailable threshold. A failed wave automatically restores the
 previous revision when `auto_rollback` is enabled. Deleting a deployment causes
 agents to stop it on their next reconciliation.
+
+Deployments may also declare accelerator count, kind, vendor, memory, and
+capability requirements. Nimbus A2 selects stable device IDs and persists
+exclusive central and local logical reservations. Actual CDI/device injection
+is an A3 milestone, so accelerator workloads currently report a blocked
+assignment or `runtime_device_injection_unavailable` and are not started.
 
 See [Workload orchestration](docs/orchestration.md) for the schema, runtime
 behavior, security controls, and production limitations.

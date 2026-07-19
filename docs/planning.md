@@ -49,9 +49,11 @@ Nimbus already provides the generic mechanisms required by this roadmap:
 - digest-pinned artifacts and optional Ed25519 verification;
 - staged rollout, health checks, rollback, and workload status history.
 
-Today an operator can manually label a node with `accelerator=jetson` and target
-it. Nimbus does not yet discover devices, measure capacity, reserve a device, or
-inject it into a runtime.
+Nimbus now discovers bounded NVIDIA and Jetson inventory, accepts declarative
+accelerator requirements, and creates exclusive logical reservations on both
+the control plane and agent. It does not yet inject a reserved device into a
+runtime; accelerator deployments remain blocked until Phase 3 supplies that
+privileged boundary.
 
 ## Non-goals
 
@@ -154,7 +156,7 @@ Labels continue to express operator intent such as site, environment, and
 device class. Accelerator requirements express machine capabilities. Operators
 should not need to maintain facts such as GPU memory in labels.
 
-The first scheduler is deliberately simple:
+The implemented allocator is deliberately simple:
 
 - filter explicit node, role, and label targets;
 - reject nodes that do not satisfy accelerator requirements;
@@ -165,10 +167,25 @@ The first scheduler is deliberately simple:
 Capacity-aware placement across an unspecified pool is deferred until inventory
 and reservations have proven reliable.
 
+Heartbeat v3 advertises the `accelerator-requirements-v1` feature. The control
+plane normalizes inventory, selects device IDs in lexical order, and enforces a
+unique `(node_id, accelerator_id)` reservation. An agent copies assignments into
+the canonical reservation ledger in `applied.json`, validates them against the
+same inventory snapshot used by its heartbeat, and fails closed on invalid or
+duplicate ownership.
+
+New reservations require a `complete` inventory. Existing compatible
+reservations survive `partial` or `unavailable` reports because an incomplete
+probe cannot prove that a device disappeared. A later `complete` report can
+confirm a missing or incompatible assignment and produces a specific placement
+reason. This conservative behavior prevents transient probe failure from
+silently reallocating a device.
+
 ## Phase 3: runtime device injection
 
-The reconciler creates a local reservation before starting a workload and
-releases it only after the runtime has stopped.
+The reconciler consumes the Phase 2 control-plane assignment and recovered
+local reservation before starting a workload. It releases ownership only after
+the runtime has stopped.
 
 - Docker and containerd should prefer the Container Device Interface (CDI) so
   vendor-specific flags do not leak into the deployment schema.
@@ -258,6 +275,15 @@ production Jetson nodes.
 
 ### A2 — Requirements and reservation
 
+**Status: software complete (2026-07-19).** Deployment requirements, heartbeat
+v3 feature negotiation, normalized inventory, deterministic matching, central
+exclusive reservations, a persistent local ledger, and machine-readable
+placement decisions are implemented. Tests cover incompatible requirements,
+no-overcommit, server restart, agent-state recovery, incomplete inventory, and
+confirmed device disappearance. Accelerator workloads intentionally report
+`accelerator_assignment_unavailable` or
+`runtime_device_injection_unavailable` and are not started until A3 is complete.
+
 - incompatible nodes are rejected with a precise reason;
 - a device cannot be assigned to two exclusive workloads;
 - reservations recover safely after agent restart.
@@ -280,9 +306,9 @@ production Jetson nodes.
 - offline, thermal, capacity, and cost policies have simulation tests;
 - no scheduling loop depends on unbounded or high-frequency database growth.
 
-## First implementation slice
+## Implementation sequence
 
-The first accelerator pull request should contain only:
+The completed A1 slice contained:
 
 1. heartbeat schema v2 with the generic accelerator inventory type;
 2. a probe registry and a deterministic fake probe for tests;
@@ -290,6 +316,9 @@ The first accelerator pull request should contain only:
 4. storage and node-inspection support for inventory;
 5. documentation and fixture-based tests.
 
-It should not allocate devices or change deployment scheduling. That separation
-lets us validate inventory accuracy on real edge hardware before desired state
-can grant privileged accelerator access.
+It did not allocate devices or change deployment scheduling. A2 then added
+logical assignment without privileged runtime access. Because A2 never starts
+an accelerator workload, a revision may safely discard and recompute its
+logical reservation. A3 must replace that provisional lifecycle with stop-first
+runtime ownership, injection, rollback, and crash-recovery semantics before
+device access is enabled.

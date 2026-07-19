@@ -82,6 +82,7 @@ src/heartbeat.zig             Heartbeat schema and local collection
 src/identity.zig              Stable node identity
 src/orchestration.zig         Desired-state types and validation
 src/reconciler.zig            Local desired/current reconciliation
+src/reservation.zig           Local accelerator reservation ledger
 src/runtime.zig               Runtime adapters and artifact verification
 src/server.zig                HTTP control plane
 src/shutdown.zig              Signal and shutdown coordination
@@ -267,10 +268,11 @@ For a backward-compatible additive field:
 
 For a breaking change, increment `schema_version` and define an explicit server
 compatibility policy before merging it. Do not silently reinterpret version 1.
-Heartbeat v2 is the current example: the server accepts v1 without accelerator
-claims and v2 with a required, validated inventory, while new agents emit v2.
-Deploy the compatible server first and agents second. Rolling the server back
-below v2 requires rolling agents back first.
+Heartbeat v3 is the current example: the server accepts v1 without accelerator
+claims, v2 with a required validated inventory, and v3 with bounded feature
+negotiation. Current agents emit v3 and advertise
+`accelerator-requirements-v1`. Deploy the compatible server first and agents
+second. Rolling the server back below v3 requires rolling agents back first.
 
 ## Changing desired-state or runtime behavior
 
@@ -342,8 +344,9 @@ sends a one-shot heartbeat, lists nodes, and terminates the server gracefully.
 
 `just api-check` verifies readiness, authentication rejection, invalid and
 oversized heartbeats, responsiveness while a slow client is connected, accepted
-heartbeat inspection, and persistence across a server restart. `just
-integration` combines this with both end-to-end demos.
+heartbeat inspection, deterministic exclusive accelerator reservation, and
+persistence across a server restart. `just integration` combines this with both
+end-to-end demos.
 
 `just orchestration-demo` additionally registers a target node, applies a
 deployment, reconciles a Linux process, verifies healthy assignment state,
@@ -426,6 +429,9 @@ identity, SQLite databases, or Docker data.
   start-time ticks.
 - **Artifact size:** post-download checks are not sufficient; enforce limits
   while copying or receiving bytes.
+- **Incomplete accelerator inventory:** `partial` and `unavailable` cannot prove
+  disappearance. Do not release or reassign an existing reservation until a
+  `complete` report establishes the new device set.
 
 ## Contribution checklist
 
