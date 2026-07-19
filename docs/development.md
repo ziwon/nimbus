@@ -337,8 +337,9 @@ backoff, endpoint construction, strict configuration, and in-memory storage.
 sends a one-shot heartbeat, lists nodes, and terminates the server gracefully.
 
 `just api-check` verifies readiness, authentication rejection, invalid and
-oversized heartbeats, accepted heartbeat inspection, and persistence across a
-server restart. `just integration` combines this with both end-to-end demos.
+oversized heartbeats, responsiveness while a slow client is connected, accepted
+heartbeat inspection, and persistence across a server restart. `just
+integration` combines this with both end-to-end demos.
 
 `just orchestration-demo` additionally registers a target node, applies a
 deployment, reconciles a Linux process, verifies healthy assignment state,

@@ -104,7 +104,12 @@ api-check port="18083" token="api-check-token": build
     database="$run_dir/nimbus.db"
     oversized="$run_dir/oversized.json"
     server_pid=""
+    slow_pid=""
     cleanup() {
+      if [ -n "$slow_pid" ]; then
+        kill "$slow_pid" 2>/dev/null || true
+        wait "$slow_pid" 2>/dev/null || true
+      fi
       if [ -n "$server_pid" ]; then
         kill "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
@@ -123,6 +128,13 @@ api-check port="18083" token="api-check-token": build
       sleep 0.2
     done
     test "$ready" = true
+
+    python -c 'import socket,sys,time; s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.sendall(b"GET /v1/nodes HTTP/1.1\r\nHost:"); time.sleep(1); s.close()' "$port" &
+    slow_pid=$!
+    sleep 0.2
+    curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null
+    wait "$slow_pid"
+    slow_pid=""
 
     test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/nodes")" = 401
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' "http://127.0.0.1:$port/v1/nodes")" = 401
