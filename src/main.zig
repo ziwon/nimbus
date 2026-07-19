@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const accelerator = @import("accelerator.zig");
 const allocation = @import("allocation.zig");
 const agent = @import("agent.zig");
+const agent_journal = @import("agent_journal.zig");
 const client = @import("client.zig");
 const config = @import("config.zig");
 const device_access = @import("device_access.zig");
@@ -672,6 +673,7 @@ test {
     _ = accelerator;
     _ = allocation;
     _ = agent;
+    _ = agent_journal;
     _ = config;
     _ = device_access;
     _ = heartbeat;
