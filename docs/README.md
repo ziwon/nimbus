@@ -11,7 +11,7 @@ installation, commands, configuration, and day-to-day operation.
 | [Project README](../README.md) | Quick start, CLI usage, configuration, Just recipes, and deployment | Users and operators |
 | [Architecture](architecture.md) | System boundaries, component responsibilities, data flow, persistence, and design trade-offs | Maintainers and reviewers |
 | [Workload orchestration](orchestration.md) | Deployment schema, targeting, runtimes, reconciliation, rollout, artifacts, and security | Operators and platform engineers |
-| [AI accelerator planning](planning.md) | Accelerator inventory, requirements, runtime injection, model lifecycle, and edge-aware placement roadmap | Maintainers and platform engineers |
+| [AI accelerator planning](planning.md) | Accelerator milestones, implemented contracts, qualification gates, and future lease safety | Maintainers and platform engineers |
 | [Development](development.md) | Project-specific Zig concepts, repository workflow, testing, debugging, and change checklists | Contributors |
 | [SQLite vendoring notes](../third_party/sqlite/README.md) | Origin and licensing of the embedded SQLite amalgamation | Maintainers and release engineers |
 
@@ -43,7 +43,7 @@ semantics and production boundaries. Development documents repository-specific
 Zig practices and change workflows.
 
 The docs describe implemented behavior, including desired-state reconciliation,
-runtime deployment, accelerator inventory, and logical reservation. Future
-runtime device injection, dynamic resource placement, secrets, high
-availability, and per-node identity should be documented as current behavior
-only after their code and tests exist.
+runtime deployment, accelerator inventory, fenced device injection, model
+lifecycle, and edge-aware placement. Future secrets, signed offline leases,
+high availability, and per-node identity should be documented as current
+behavior only after their code and tests exist.

@@ -8,11 +8,11 @@ servers, and cloud hosts. The goal is operational continuity on heterogeneous
 fleets without requiring every device to run a Kubernetes node stack.
 
 The implementation includes runtime control, reconciliation, health checks,
-staged rollout, rollback, artifact integrity, status history, and exclusive
-accelerator reservation within explicitly targeted nodes. It is not a general
-container scheduler: it does not choose nodes from an unspecified resource
-pool, provide a service network, attach distributed storage, or implement
-Kubernetes API compatibility.
+staged rollout, rollback, artifact integrity, status history, exclusive
+accelerator reservation, and replica placement within explicitly targeted
+nodes. It is not a general container scheduler: it does not discover an
+unspecified resource pool, provide a service network, attach distributed
+storage, or implement Kubernetes API compatibility.
 
 ## Topology model
 
@@ -83,6 +83,18 @@ labels and rolls out ten nodes at a time:
       "capabilities": ["fp16"]
     }
   },
+  "placement": {
+    "replicas": 1,
+    "max_offline_seconds": 90,
+    "min_connectivity_quality_percent": 60,
+    "allowed_power_sources": ["mains", "battery"],
+    "min_power_budget_milliwatts": 15000,
+    "max_cost_microunits_per_hour": 500000,
+    "min_accelerator_free_memory_bytes": 2147483648,
+    "max_accelerator_temperature_millicelsius": 85000,
+    "max_accelerator_power_milliwatts": 30000,
+    "prefer_cached_artifact": true
+  },
   "health_check": {
     "kind": "http",
     "target": "http://127.0.0.1:9000/healthz",
@@ -145,12 +157,13 @@ the latest role and labels when rebuilding assignments.
 The declaration describes hardware compatibility; labels continue to describe
 operator intent such as site or device class.
 
-A heartbeat v3 agent advertises `accelerator-requirements-v1`. For each matching
-node, the control plane filters the normalized inventory, excludes IDs reserved
-by other deployments, sorts compatible IDs lexically, and reserves the required
-count atomically. The database uniqueness key is `(node_id, accelerator_id)`, so
-two workloads cannot own one exclusive device. The assignment is also persisted
-in the agent's canonical `applied.json` ledger and recovered after restart.
+Heartbeat v3 and v4 agents advertise `accelerator-requirements-v1`. For each
+matching node, the control plane filters the normalized inventory, excludes IDs
+reserved by other deployments, sorts compatible IDs lexically, and reserves the
+required count atomically. The database uniqueness key is
+`(node_id, accelerator_id)`, so two workloads cannot own one exclusive device.
+The assignment is also persisted in the agent's canonical `applied.json` ledger
+and recovered after restart.
 
 New placement fails closed unless inventory is `complete`. An existing
 compatible reservation is retained when a later inventory is `partial` or
@@ -167,6 +180,41 @@ assignments with generation-fenced run/release commands. Claims remain durable
 until an exact runtime stop, `released_ack_pending`, and the server's final
 release acknowledgement complete. A missing or foreign runtime identity fails
 closed and keeps the claim.
+
+## Edge-aware placement
+
+`placement` is optional. Without it, every target remains eligible as before.
+With it, `replicas` selects the best N nodes from the explicit target pool; a
+null `replicas` retains every eligible target. Agents negotiate
+`edge-placement-v1` in heartbeat v4 and report bounded current telemetry. The
+agent configuration and equivalent flags/environment variables can declare
+connectivity quality, `unknown`/`mains`/`battery` power source, available power
+budget, and hourly cost in operator-defined microunits. NVIDIA discovery also
+reports current free memory, temperature, and power draw when available.
+
+Hard filters run in a fixed order: offline deadline, telemetry validity,
+connectivity, allowed power source, power budget, cost ceiling, accelerator free
+memory, maximum temperature, and accelerator power. Eligible nodes are ranked
+by verified artifact-cache hit, connectivity, free accelerator memory, lower
+temperature, lower cost, and node ID as the final tie-break. Reversing heartbeat
+or HTTP request order therefore cannot alter an equal-input result.
+
+The control plane persists the selected set and a bounded reason code/detail in
+the same transaction as deployment or heartbeat processing. `inspect` exposes
+`placement_selected`, `placement_sticky`, `not_selected_lower_rank`, and hard
+filter reasons. Desired-state reads use the stored plan and remove the
+controller-only `placement` field before sending the deployment to an agent.
+Current-state rows are upserted; placement does not add a high-frequency history
+stream. Unselected candidates have assignment wave `-1`, which explicitly
+excludes them from rollout health gates; selected replicas receive dense,
+deterministic waves beginning at zero.
+
+Selections are intentionally sticky. A healthier or cheaper node may fill an
+unallocated replica, but does not preempt a running selection, and an offline
+singleton is not automatically moved. Without a signed expiring lease, moving
+it could run two copies after a network partition. Operators must recover,
+revise, roll back, or delete the deployment; automatic fenced failover remains
+future work.
 
 ## Runtime adapters
 

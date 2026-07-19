@@ -217,7 +217,8 @@ fallback; fallback is never implicit.
 
 ## Phase 5: edge-aware placement
 
-After static allocation is stable, add dynamic constraints:
+The placement phase applies these dynamic constraints after static
+compatibility and reservation checks:
 
 - free accelerator memory and active reservations;
 - temperature and thermal throttling;
@@ -332,6 +333,19 @@ still limited to absolute `file://` and plain `http://` sources.
 
 ### A5 — Placement
 
+**Status: software complete (2026-07-19).** Heartbeat v4 carries bounded node,
+cache, and accelerator telemetry behind `edge-placement-v1`. A pure scheduler
+applies fixed hard filters and deterministic tie-breaking, while SQLite stores
+the selected replica set and machine-readable details transactionally. Stored
+selections are sticky across polling order, telemetry changes, and server
+restart; desired-state GET never reschedules and removes the controller-only
+policy before agent delivery. Current rows are upserted and heartbeat history
+retains its existing sampling bound. Simulations cover reversed input order,
+offline nodes, thermal and memory limits, cost, cache locality, and 1,000
+heartbeat updates without row growth. Signed lease fencing and real Jetson/GPU
+thermal and power qualification remain open before automatic cross-node
+failover or safety-critical use.
+
 - placement is explainable and deterministic for equal inputs;
 - offline, thermal, capacity, and cost policies have simulation tests;
 - no scheduling loop depends on unbounded or high-frequency database growth.
@@ -352,4 +366,6 @@ an accelerator workload, a revision may safely discard and recompute its
 logical reservation. A3 replaces that provisional lifecycle with stop-first
 runtime ownership, exact injection, rollback, local restart, and crash-recovery
 semantics. A4 builds artifact variants and cache policy on this fenced runtime
-boundary.
+boundary. A5 adds deterministic admission and sticky replica placement inside
+explicit target pools; signed leases are the next prerequisite for safe
+automatic failover between disconnected nodes.

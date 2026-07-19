@@ -15,6 +15,7 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - declarative accelerator requirements with exclusive logical reservations;
 - generation-fenced accelerator execution with exact CDI/runtime handles;
 - deterministic platform/accelerator artifact variants and a pinned local cache;
+- deterministic edge-aware placement using bounded live telemetry and cache locality;
 - a versioned desired-state and reconciliation loop;
 - opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
 - batched rollout, health gates, status history, and automatic rollback;
@@ -143,6 +144,10 @@ Every operational command accepts a JSON configuration file with `--config`:
   "require_artifact_signatures": true,
   "max_artifact_bytes": 8589934592,
   "artifact_cache_bytes": 17179869184,
+  "connectivity_quality_percent": 100,
+  "power_source": "mains",
+  "power_budget_milliwatts": 30000,
+  "cost_microunits_per_hour": 0,
   "token_file": "/run/secrets/nimbus-node-token",
   "admin_token_file": "/run/secrets/nimbus-admin-token",
   "bind": "127.0.0.1",
@@ -165,7 +170,9 @@ then built-in default. Supported environment variables include:
   `NIMBUS_STALE_AFTER_SECONDS`, and `NIMBUS_ALLOW_INSECURE_NO_AUTH`;
 - `NIMBUS_ORCHESTRATION`, `NIMBUS_RUNTIMES`, `NIMBUS_STATE_DIR`,
   `NIMBUS_ARTIFACT_PUBLIC_KEY`, `NIMBUS_REQUIRE_ARTIFACT_SIGNATURES`, and
-  `NIMBUS_MAX_ARTIFACT_BYTES`, and `NIMBUS_ARTIFACT_CACHE_BYTES`.
+  `NIMBUS_MAX_ARTIFACT_BYTES`, and `NIMBUS_ARTIFACT_CACHE_BYTES`;
+- `NIMBUS_CONNECTIVITY_QUALITY_PERCENT`, `NIMBUS_POWER_SOURCE`,
+  `NIMBUS_POWER_BUDGET_MILLIWATTS`, and `NIMBUS_COST_MICROUNITS_PER_HOUR`.
 
 Use separate configuration files for the server/operator and agent in real
 deployments so the administrative token is never copied to managed nodes.
@@ -195,9 +202,10 @@ and returns `{ "items": [...], "next_after": "..." | null }`.
 
 Heartbeats are schema-versioned and validated before they are written. The
 server accepts legacy v1 reports, v2 reports with a required accelerator
-inventory, and v3 reports with bounded feature negotiation; current agents emit
-v3. Upgrade the server before agents during a rolling deployment. CPU-only
-discovery is distinct from a failed or unavailable probe.
+inventory, v3 reports with bounded feature negotiation, and v4 reports with
+bounded placement telemetry. Current agents emit v4. Upgrade the server before
+agents during a rolling deployment. CPU-only discovery is distinct from a
+failed or unavailable probe.
 SQLite always updates current node state, samples heartbeat history at most
 every five minutes per node, retains it for seven days, and retains audit events
 for 30 days. Enrollment is audited once instead of auditing every accepted
@@ -247,6 +255,13 @@ CDI devices or vendor-verified host allowlists. Claims remain held through
 stop, rollback, crash recovery, and the final release acknowledgement. NVIDIA
 container execution requires the exact device to be present in the local CDI
 catalog; Nimbus never falls back to `all` or broad host-device access.
+
+An optional placement policy selects a replica count from the explicitly
+targeted pool using liveness, connectivity, power, cost, accelerator headroom,
+temperature, and verified artifact-cache locality. Decisions and reason codes
+are persisted and remain sticky across polling and server restarts. Nimbus does
+not automatically move an already selected singleton merely because its node
+goes offline; safe cross-node failover requires the future signed-lease policy.
 
 See [Workload orchestration](docs/orchestration.md) for the schema, runtime
 behavior, security controls, and production limitations.

@@ -25,6 +25,7 @@ Nimbus currently provides:
 - bounded NVIDIA and Jetson accelerator inventory with opaque device IDs;
 - declarative accelerator requirements and exclusive logical reservations;
 - fenced accelerator run/release commands and exact runtime-device injection;
+- deterministic, explainable edge placement from bounded current telemetry;
 - desired-state storage and agent-side reconciliation;
 - process, systemd, Docker, and containerd/nerdctl adapters behind an allowlist;
 - runtime, HTTP, TCP, and direct-command health checks;
@@ -103,6 +104,7 @@ flowchart TB
     Identity[identity.zig<br/>node identity]
     Heartbeat[heartbeat.zig<br/>inventory and labels]
     Accelerator[accelerator.zig<br/>bounded hardware probes]
+    Placement[placement.zig<br/>filters and stable ranking]
     Agent[agent.zig<br/>lifecycle and retry]
     Reconcile[reconciler.zig<br/>desired/current diff]
     Reservation[reservation.zig<br/>local accelerator ownership]
@@ -124,6 +126,8 @@ flowchart TB
     Main --> Server
     Agent --> Heartbeat
     Heartbeat --> Accelerator
+    Server --> Placement
+    Placement --> Storage
     Agent --> Reconcile
     Agent --> Client
     Agent --> Shutdown
@@ -148,6 +152,7 @@ flowchart TB
 | `identity.zig` | Node-ID validation and atomic identity creation |
 | `heartbeat.zig` | Versioned node report, role, labels, and target metadata |
 | `accelerator.zig` | Generic accelerator types, bounded providers, and claim validation |
+| `placement.zig` | Pure hard filters, deterministic ranking, and reason details |
 | `agent.zig` | Heartbeat/reconcile loop, jitter, retry, and one-shot behavior |
 | `orchestration.zig` | Desired-state types and trust-boundary validation |
 | `reconciler.zig` | Local diff, apply/stop/restart, health, restore, and status |
@@ -192,13 +197,14 @@ between a trustworthy empty `complete` inventory and `partial` or `unavailable`
 probe results. NVIDIA UUIDs are converted to node-scoped opaque hashes; Jetson
 GPU and DLA identities use stable functional slots.
 
-The server accepts heartbeat versions 1, 2, and 3 during rolling upgrades.
+The server accepts heartbeat versions 1 through 4 during rolling upgrades.
 Version 1 has no accelerator inventory, version 2 requires a bounded and
-internally consistent inventory, and version 3 also carries negotiated feature
-names. Current agents emit v3 with `accelerator-requirements-v1`. Linux agents
-also emit `accelerator-lifecycle-v1` only when orchestration and a runtime are
-enabled. Servers must be upgraded before agents because older servers reject
-newer heartbeat schemas.
+internally consistent inventory, version 3 also carries negotiated feature
+names, and version 4 can carry bounded placement telemetry. Current agents emit
+v4. Orchestration-capable Linux agents advertise `edge-placement-v1` together
+with placement telemetry; the server requires the feature and telemetry to
+appear together. Servers must be upgraded before agents because older servers
+reject newer heartbeat schemas.
 
 Linux process agents additionally advertise `artifact-variants-v1`. The
 control plane omits variant specifications for agents without that feature,
@@ -241,6 +247,22 @@ Release is stop-first: only `released_ack_pending` lets the control plane delete
 claims, and the agent records the returned acknowledgement as a tombstone.
 A2-only agents retain the earlier logical reservation and blocked-execution
 behavior.
+
+For a deployment with a placement policy, role, label, node, and `all` targets
+first define the eligible pool. The control plane applies hard liveness,
+connectivity, power, cost, and accelerator filters, then ranks cache locality,
+connectivity, free memory, temperature, cost, and finally node ID. The selected
+replica set and bounded reason details are stored transactionally in
+`placement_decisions`. Desired-state reads consume that plan and strip the
+controller-only policy before sending strict JSON to agents; request order
+cannot change scheduling. Unselected candidates use assignment wave `-1`, while
+selected replicas receive dense waves starting at zero, so non-selected targets
+cannot stall rollout health gates.
+
+An existing selection is sticky, including across server restart. Nimbus does
+not transfer a singleton after an offline heartbeat because the control plane
+cannot prove the old node stopped while disconnected. Automatic cross-node
+failover is deferred until signed, expiring leases can fence the old owner.
 
 ## Desired-state and rollout model
 
@@ -333,6 +355,12 @@ selection. Current device rows are replaced by each heartbeat, but logical
 reservations remain independent so a partial probe or disappearance does not
 silently transfer ownership to another workload.
 
+Placement uses only these bounded current rows plus the cached digest list in
+the latest canonical report. A heartbeat recomputes admission for unfilled
+replicas by upserting one decision per deployment/node; it never creates a
+high-frequency placement-history table. The separately sampled heartbeat
+history therefore remains bounded by its existing retention policy.
+
 This architecture handles overlapping edge requests without claiming
 horizontal control-plane scale. One server process and one database remain the
 consistency boundary.
@@ -364,13 +392,15 @@ shared node token allows node impersonation by another token holder.
 
 - One SQLite control plane; no replication, leader election, or failover.
 - No rollout deadline or automatic skip for an offline current-wave node.
-- No pool-wide or dynamic resource placement; A2 allocates only within explicit
-  node, role, and label targets.
+- Placement chooses replicas only inside explicit node, role, label, or `all`
+  targets; it is not a cluster-wide general-purpose scheduler.
 - Built-in NVIDIA execution requires an exact CDI catalog entry; verified host
   profiles for built-in NVIDIA/Jetson process and systemd workloads are not yet
   provided, so those adapters fail closed unless a provider supplies one.
 - No ports, mounts, network, secret, or general resource-limit schema.
 - No offline deadline/lease that stops workloads after prolonged disconnection.
+- No automatic cross-node failover for a sticky selection without a signed
+  lease proving the previous owner is fenced.
 - Process runtime is Linux-only and intentionally smaller than systemd.
 - HTTP-only embedded server, process artifact downloads, and runtime health URLs.
 - Windows/macOS artifacts compile, but orchestration adapters depend on host

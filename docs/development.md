@@ -80,11 +80,13 @@ src/agent_journal.zig         Crash-safe accelerator operation journal
 src/accelerator_agent.zig     Production lifecycle effect bindings
 src/accelerator_reconciler.zig Fenced accelerator state machine
 src/accelerator_runtime.zig   Exact CDI and host runtime adapters
+src/artifact_cache.zig        Bounded content-addressed cache and active pins
 src/client.zig                HTTP client operations
 src/config.zig                JSON and environment configuration
 src/heartbeat.zig             Heartbeat schema and local collection
 src/identity.zig              Stable node identity
 src/orchestration.zig         Desired-state types and validation
+src/placement.zig             Pure edge-placement filters and stable ranking
 src/reconciler.zig            Local desired/current reconciliation
 src/reservation.zig           Local accelerator reservation ledger
 src/runtime.zig               Runtime adapters and artifact verification
@@ -272,11 +274,12 @@ For a backward-compatible additive field:
 
 For a breaking change, increment `schema_version` and define an explicit server
 compatibility policy before merging it. Do not silently reinterpret version 1.
-Heartbeat v3 is the current example: the server accepts v1 without accelerator
-claims, v2 with a required validated inventory, and v3 with bounded feature
-negotiation. Current agents emit v3 and advertise
-`accelerator-requirements-v1`. Deploy the compatible server first and agents
-second. Rolling the server back below v3 requires rolling agents back first.
+Heartbeat v4 is the current example: the server accepts v1 without accelerator
+claims, v2 with a required validated inventory, v3 with bounded feature
+negotiation, and v4 with optional bounded placement telemetry. Current agents
+emit v4; orchestration-capable agents advertise `edge-placement-v1` and must
+include the matching telemetry. Deploy the compatible server first and agents
+second. Rolling the server back below v4 requires rolling agents back first.
 
 ## Changing desired-state or runtime behavior
 
