@@ -32,6 +32,8 @@ doctor:
     @printf 'git:  '; git --version
     @printf 'shellcheck: '; shellcheck --version | sed -n '1p'
     @printf 'curl: '; curl --version | sed -n '1p'
+    @printf 'python: '; python --version
+    @printf 'openssl: '; openssl version
     @if command -v docker >/dev/null 2>&1; then printf 'docker: '; docker --version; else printf '%s\n' 'docker: optional, not installed'; fi
 
 # Format Zig sources.
@@ -200,8 +202,142 @@ api-check port="18083" token="api-check-token": build
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/gpu-b" | grep -Fq '"reason_code":"accelerator_capacity_exhausted"'
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-lifecycle/desired-state" | grep -Fq '"accelerator_allocations":[]'
 
+# Verify per-node credentials, rotation, scopes, and active-connection shutdown.
+auth-check port="18085": build
+    #!/usr/bin/env sh
+    set -eu
+    port={{ quote(port) }}
+    run_dir=$(mktemp -d "${TMPDIR:-/tmp}/nimbus-auth-check-XXXXXX")
+    token_dir="$run_dir/tokens"
+    database="$run_dir/nimbus.db"
+    admin_token=auth-admin-token
+    shared_token=shared-token-must-not-bypass
+    node_a_token=node-a-token
+    node_b_token=node-b-token
+    server_pid=""
+    slow_pid=""
+    cleanup() {
+      if [ -n "$slow_pid" ]; then
+        kill "$slow_pid" 2>/dev/null || true
+        wait "$slow_pid" 2>/dev/null || true
+      fi
+      if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+      fi
+      find "$run_dir" -depth -delete 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+    mkdir -m 700 "$token_dir"
+    printf '%s\n' "$node_a_token" > "$token_dir/node-a"
+    printf '%s\n' "$node_b_token" > "$token_dir/node-b"
+    chmod 600 "$token_dir/node-a" "$token_dir/node-b"
+
+    NIMBUS_TOKEN="$shared_token" NIMBUS_ADMIN_TOKEN="$admin_token" \
+      ./zig-out/bin/nimbus server --bind 127.0.0.1 --port "$port" \
+      --database "$database" --node-token-dir "$token_dir" &
+    server_pid=$!
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS "http://127.0.0.1:$port/readyz" >/dev/null 2>&1; then ready=true; break; fi
+      sleep 0.2
+    done
+    test "$ready" = true
+
+    heartbeat='{"schema_version":1,"node_id":"node-a","hostname":"node-a","role":"edge","platform":{"os":"linux","arch":"x86_64","abi":"gnu"},"resources":{"cpu_count":2},"timestamp_unix_ms":1000}'
+    heartbeat_code() {
+      curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" \
+        -H 'Content-Type: application/json' --data "$heartbeat" \
+        "http://127.0.0.1:$port/v1/heartbeat"
+    }
+    test "$(heartbeat_code "$node_a_token")" = 202
+    test "$(heartbeat_code "$node_b_token")" = 401
+    test "$(heartbeat_code "$shared_token")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $node_b_token" "http://127.0.0.1:$port/v1/nodes/node-a/desired-state")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $node_a_token" "http://127.0.0.1:$port/v1/nodes/node-a/desired-state")" = 200
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $node_a_token" "http://127.0.0.1:$port/v1/nodes")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $admin_token" "http://127.0.0.1:$port/v1/nodes")" = 200
+
+    rotated_token=node-a-rotated-token
+    printf '%s\n' "$rotated_token" > "$token_dir/node-a.next"
+    chmod 600 "$token_dir/node-a.next"
+    mv "$token_dir/node-a.next" "$token_dir/node-a"
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $node_a_token" "http://127.0.0.1:$port/v1/nodes/node-a/desired-state")" = 401
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $rotated_token" "http://127.0.0.1:$port/v1/nodes/node-a/desired-state")" = 200
+
+    python -c 'import socket,sys,time; s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.sendall(b"GET /v1/nodes HTTP/1.1\r\nHost:"); time.sleep(30)' "$port" &
+    slow_pid=$!
+    sleep 0.2
+    kill -TERM "$server_pid"
+    stopped=false
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+      if ! kill -0 "$server_pid" 2>/dev/null; then stopped=true; break; fi
+      sleep 0.1
+    done
+    test "$stopped" = true
+    wait "$server_pid"
+    server_pid=""
+    kill "$slow_pid" 2>/dev/null || true
+    wait "$slow_pid" 2>/dev/null || true
+    slow_pid=""
+
+# Exercise HTTPS for both the agent and operator CLI with a private CA.
+https-check port="18086" tls_port="18443" token="https-check-token": build
+    #!/usr/bin/env sh
+    set -eu
+    port={{ quote(port) }}
+    tls_port={{ quote(tls_port) }}
+    token={{ quote(token) }}
+    run_dir=$(mktemp -d "${TMPDIR:-/tmp}/nimbus-https-check-XXXXXX")
+    database="$run_dir/nimbus.db"
+    server_pid=""
+    proxy_pid=""
+    cleanup() {
+      if [ -n "$proxy_pid" ]; then kill "$proxy_pid" 2>/dev/null || true; wait "$proxy_pid" 2>/dev/null || true; fi
+      if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi
+      find "$run_dir" -depth -delete 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=Nimbus Test CA' \
+      -keyout "$run_dir/ca.key" -out "$run_dir/ca.crt" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' \
+      -keyout "$run_dir/server.key" -out "$run_dir/server.csr" >/dev/null 2>&1
+    printf '%s\n' 'subjectAltName=DNS:localhost,IP:127.0.0.1' 'extendedKeyUsage=serverAuth' > "$run_dir/server.ext"
+    openssl x509 -req -days 1 -in "$run_dir/server.csr" -CA "$run_dir/ca.crt" \
+      -CAkey "$run_dir/ca.key" -CAcreateserial -extfile "$run_dir/server.ext" \
+      -out "$run_dir/server.crt" >/dev/null 2>&1
+
+    NIMBUS_TOKEN="$token" NIMBUS_ADMIN_TOKEN="$token" \
+      ./zig-out/bin/nimbus server --bind 127.0.0.1 --port "$port" --database "$database" &
+    server_pid=$!
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS "http://127.0.0.1:$port/readyz" >/dev/null 2>&1; then ready=true; break; fi
+      sleep 0.2
+    done
+    test "$ready" = true
+    python scripts/tls-proxy.py --listen-port "$tls_port" --backend-port "$port" \
+      --cert "$run_dir/server.crt" --key "$run_dir/server.key" &
+    proxy_pid=$!
+    tls_ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl --cacert "$run_dir/ca.crt" -fsS "https://localhost:$tls_port/healthz" >/dev/null 2>&1; then tls_ready=true; break; fi
+      sleep 0.2
+    done
+    test "$tls_ready" = true
+
+    if (unset NIMBUS_CA_FILE; NIMBUS_TOKEN="$token" ./zig-out/bin/nimbus agent run --once --id tls-rejected --server "https://localhost:$tls_port") >/dev/null 2>&1; then
+      printf '%s\n' 'private CA unexpectedly trusted without NIMBUS_CA_FILE' >&2
+      exit 1
+    fi
+    NIMBUS_CA_FILE="$run_dir/ca.crt" NIMBUS_TOKEN="$token" \
+      ./zig-out/bin/nimbus agent run --once --id tls-edge --server "https://localhost:$tls_port"
+    NIMBUS_CA_FILE="$run_dir/ca.crt" NIMBUS_ADMIN_TOKEN="$token" \
+      ./zig-out/bin/nimbus nodes inspect tls-edge --server "https://localhost:$tls_port" | grep -q '"node_id":"tls-edge"'
+
 # Run native end-to-end checks.
-integration: demo api-check orchestration-demo
+integration: demo api-check auth-check https-check orchestration-demo
 
 # Run the complete local/CI verification pipeline.
 ci: check integration release verify-static checksums
