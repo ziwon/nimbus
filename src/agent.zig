@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const accelerator = @import("accelerator.zig");
+const artifact_cache = @import("artifact_cache.zig");
 const heartbeat = @import("heartbeat.zig");
+const placement = @import("placement.zig");
 const client = @import("client.zig");
 const reconciler = @import("reconciler.zig");
 const runtime = @import("runtime.zig");
@@ -19,6 +21,7 @@ pub const Options = struct {
     orchestration_enabled: bool,
     runtime_options: runtime.Options,
     token: ?[]const u8,
+    placement_telemetry: placement.Telemetry = .{},
     once: bool = false,
 };
 
@@ -45,7 +48,26 @@ pub fn run(init: std.process.Init, options: Options) !void {
         };
         defer inventory.deinit();
         const inventory_report = inventory.report();
-        const sent = sendOnce(init, endpoint, options, inventory_report) catch |err| blk: {
+        var cached = artifact_cache.listDigests(
+            init,
+            options.runtime_options.state_dir,
+        ) catch null;
+        defer if (cached) |*owned| owned.deinit();
+        var placement_telemetry = options.placement_telemetry;
+        placement_telemetry.cached_artifact_sha256 = if (cached) |owned|
+            owned.items
+        else
+            &.{};
+        const sent = sendOnce(
+            init,
+            endpoint,
+            options,
+            inventory_report,
+            if (options.orchestration_enabled and options.runtime_options.enabled.any())
+                placement_telemetry
+            else
+                null,
+        ) catch |err| blk: {
             try log(init, "heartbeat failed: {t}; retrying in {d}s\n", .{ err, backoff });
             break :blk false;
         };
@@ -78,18 +100,20 @@ fn sendOnce(
     endpoint: []const u8,
     options: Options,
     inventory: accelerator.InventoryReport,
+    placement_telemetry: ?placement.Telemetry,
 ) !bool {
     const features = advertisedFeatures(
         options.orchestration_enabled,
         options.runtime_options.enabled,
     );
-    const value = heartbeat.collect(
+    const value = heartbeat.collectWithPlacement(
         init,
         options.node_id,
         options.role,
         options.labels,
         features,
         inventory,
+        placement_telemetry,
     );
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);
@@ -117,12 +141,14 @@ fn advertisedFeatures(
             heartbeat.feature_accelerator_requirements_v1,
             heartbeat.feature_accelerator_lifecycle_v1,
             heartbeat.feature_artifact_variants_v1,
+            heartbeat.feature_edge_placement_v1,
         }
     else if (builtin.os.tag == .linux and
         orchestration_enabled and enabled_runtimes.any())
         &.{
             heartbeat.feature_accelerator_requirements_v1,
             heartbeat.feature_accelerator_lifecycle_v1,
+            heartbeat.feature_edge_placement_v1,
         }
     else
         &.{heartbeat.feature_accelerator_requirements_v1};
@@ -170,13 +196,18 @@ test "accelerator lifecycle capability is advertised only when executable" {
     );
     const enabled = advertisedFeatures(true, .{ .process = true });
     try std.testing.expectEqual(
-        @as(usize, if (builtin.os.tag == .linux) 3 else 1),
+        @as(usize, if (builtin.os.tag == .linux) 4 else 1),
         enabled.len,
     );
     if (builtin.os.tag == .linux)
         try std.testing.expectEqualStrings(
             heartbeat.feature_artifact_variants_v1,
             enabled[2],
+        );
+    if (builtin.os.tag == .linux)
+        try std.testing.expectEqualStrings(
+            heartbeat.feature_edge_placement_v1,
+            enabled[3],
         );
     try std.testing.expectEqual(
         @as(usize, 1),

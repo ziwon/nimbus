@@ -4,6 +4,17 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const digest_hex_len = Sha256.digest_length * 2;
 const maximum_pin_bytes = digest_hex_len + 1;
 
+pub const OwnedDigests = struct {
+    allocator: std.mem.Allocator,
+    items: []const []const u8,
+
+    pub fn deinit(self: *OwnedDigests) void {
+        for (self.items) |item| self.allocator.free(item);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
 const CacheEntry = struct {
     name: []u8,
     size: u64,
@@ -62,6 +73,42 @@ pub fn unpin(
     deployment: []const u8,
 ) !void {
     return unpinWith(init.gpa, init.io, state_dir, deployment);
+}
+
+/// Lists at most 128 canonical cache digests in lexical order for placement
+/// locality telemetry. Artifact contents are never read into heartbeat data.
+pub fn listDigests(init: std.process.Init, state_dir: []const u8) !OwnedDigests {
+    const root = try std.fs.path.join(
+        init.gpa,
+        &.{ state_dir, "artifacts", "sha256" },
+    );
+    defer init.gpa.free(root);
+    var dir = std.Io.Dir.cwd().openDir(init.io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .allocator = init.gpa,
+            .items = try init.gpa.alloc([]const u8, 0),
+        },
+        else => return err,
+    };
+    defer dir.close(init.io);
+    var values: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (values.items) |value| init.gpa.free(value);
+        values.deinit(init.gpa);
+    }
+    var iterator = dir.iterateAssumeFirstIteration();
+    while (try iterator.next(init.io)) |entry| {
+        if (entry.kind != .file or !isCanonicalDigest(entry.name))
+            return error.CorruptArtifactCache;
+        if (values.items.len >= 128) return error.TooManyCachedArtifacts;
+        try values.append(init.gpa, try init.gpa.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, values.items, {}, lessDigest);
+    return .{ .allocator = init.gpa, .items = try values.toOwnedSlice(init.gpa) };
+}
+
+fn lessDigest(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
 fn admitWith(

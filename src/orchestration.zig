@@ -1,6 +1,7 @@
 const std = @import("std");
 const accelerator = @import("accelerator.zig");
 const allocation = @import("allocation.zig");
+const placement = @import("placement.zig");
 
 pub const schema_version: u8 = 1;
 
@@ -123,6 +124,7 @@ pub const Deployment = struct {
     health_check: HealthCheck = .{},
     restart_policy: RestartPolicy = .always,
     resources: ?Resources = null,
+    placement: ?placement.Policy = null,
     targets: Targets,
     rollout: Rollout = .{},
 };
@@ -166,6 +168,13 @@ pub fn validateDeployment(value: Deployment) bool {
     if (!validHealth(value.health_check)) return false;
     if (value.resources) |resources| {
         if (!accelerator.validateRequirement(resources.accelerators)) return false;
+    }
+    if (value.placement) |policy| {
+        if (!placement.validatePolicy(policy)) return false;
+        if ((policy.min_accelerator_free_memory_bytes != null or
+            policy.max_accelerator_temperature_millicelsius != null or
+            policy.max_accelerator_power_milliwatts != null) and
+            value.resources == null) return false;
     }
     if (value.artifact) |artifact| {
         if (!validArtifact(artifact)) return false;

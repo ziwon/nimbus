@@ -5,6 +5,7 @@ const allocation = @import("allocation.zig");
 const heartbeat = @import("heartbeat.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
+const placement = @import("placement.zig");
 const shutdown = @import("shutdown.zig");
 const storage = @import("storage.zig");
 
@@ -465,13 +466,29 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
         }
     }
     return switch (value.schema_version) {
-        1 => value.accelerator_inventory == null and value.features.len == 0,
-        2 => value.features.len == 0 and validAcceleratorInventory(value.accelerator_inventory),
-        heartbeat.current_schema_version => validFeatures(value.features) and
+        1 => value.accelerator_inventory == null and value.placement_telemetry == null and
+            value.features.len == 0,
+        2 => value.placement_telemetry == null and value.features.len == 0 and
+            validAcceleratorInventory(value.accelerator_inventory),
+        3 => value.placement_telemetry == null and validFeatures(value.features) and
             validAcceleratorInventory(value.accelerator_inventory) and
+            !featurePresent(value.features, heartbeat.feature_edge_placement_v1) and
             (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
                 featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
             (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
+                featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)),
+        heartbeat.current_schema_version => validFeatures(value.features) and
+            validAcceleratorInventory(value.accelerator_inventory) and
+            (if (value.placement_telemetry) |telemetry|
+                placement.validateTelemetry(telemetry) and
+                    featurePresent(value.features, heartbeat.feature_edge_placement_v1)
+            else
+                !featurePresent(value.features, heartbeat.feature_edge_placement_v1)) and
+            (!featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1) or
+                featurePresent(value.features, heartbeat.feature_accelerator_requirements_v1)) and
+            (!featurePresent(value.features, heartbeat.feature_artifact_variants_v1) or
+                featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)) and
+            (!featurePresent(value.features, heartbeat.feature_edge_placement_v1) or
                 featurePresent(value.features, heartbeat.feature_accelerator_lifecycle_v1)),
         else => false,
     };
@@ -555,7 +572,7 @@ fn respondJson(request: *std.http.Server.Request, body: []const u8, status: std.
 
 test "heartbeat validation rejects unsupported schemas" {
     const value: heartbeat.Heartbeat = .{
-        .schema_version = 4,
+        .schema_version = heartbeat.current_schema_version + 1,
         .node_id = "edge-01",
         .hostname = "edge-01",
         .role = "edge",
@@ -593,6 +610,10 @@ test "heartbeat validation accepts version one during rolling upgrades" {
         }},
     };
     try std.testing.expect(!validHeartbeat(with_inventory));
+
+    var with_placement = value;
+    with_placement.placement_telemetry = .{};
+    try std.testing.expect(!validHeartbeat(with_placement));
 }
 
 test "heartbeat validation requires inventory in version two" {
@@ -649,6 +670,7 @@ test "heartbeat version two accepts inventory but rejects features" {
 
 test "heartbeat version three validates bounded unique features" {
     const base: heartbeat.Heartbeat = .{
+        .schema_version = 3,
         .node_id = "edge-v3",
         .hostname = "edge-v3",
         .role = "edge",
@@ -702,6 +724,43 @@ test "heartbeat version three validates bounded unique features" {
         heartbeat.feature_accelerator_lifecycle_v1,
     };
     try std.testing.expect(validHeartbeat(lifecycle));
+}
+
+test "heartbeat version four binds edge placement feature to valid telemetry" {
+    const base: heartbeat.Heartbeat = .{
+        .node_id = "edge-v4",
+        .hostname = "edge-v4",
+        .role = "edge",
+        .features = &.{
+            heartbeat.feature_accelerator_requirements_v1,
+            heartbeat.feature_accelerator_lifecycle_v1,
+            heartbeat.feature_edge_placement_v1,
+        },
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &.{},
+            .probes = &.{.{
+                .name = "nvidia-smi",
+                .status = .not_present,
+                .devices_found = 0,
+            }},
+        },
+        .placement_telemetry = .{ .power_source = .battery },
+        .timestamp_unix_ms = 1000,
+    };
+    try std.testing.expect(validHeartbeat(base));
+    var missing = base;
+    missing.placement_telemetry = null;
+    try std.testing.expect(!validHeartbeat(missing));
+    var invalid = base;
+    invalid.placement_telemetry = .{ .connectivity_quality_percent = 101 };
+    try std.testing.expect(!validHeartbeat(invalid));
+    var legacy_schema = base;
+    legacy_schema.schema_version = 3;
+    legacy_schema.placement_telemetry = null;
+    try std.testing.expect(!validHeartbeat(legacy_schema));
 }
 
 test "node orchestration subresources reject nested identifiers" {

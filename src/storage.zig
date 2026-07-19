@@ -3,6 +3,7 @@ const accelerator = @import("accelerator.zig");
 const allocation = @import("allocation.zig");
 const heartbeat = @import("heartbeat.zig");
 const orchestration = @import("orchestration.zig");
+const edge_placement = @import("placement.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -341,6 +342,7 @@ pub const Registry = struct {
         }
 
         try self.replaceNodeAcceleratorInventory(report, received_unix_ms);
+        try self.reschedulePlacementDeployments(received_unix_ms);
 
         if (sample_history) {
             var history = try self.prepare(
@@ -617,6 +619,28 @@ pub const Registry = struct {
         try clear_targets.bindText(1, deployment.name);
         try clear_targets.done();
 
+        if (deployment.placement != null) {
+            var preserve_active = try self.prepare(
+                \\INSERT INTO placement_decisions (
+                \\  deployment_name, node_id, revision, status, reason_code,
+                \\  reason_detail, updated_unix_ms
+                \\)
+                \\SELECT deployment_name, node_id, ?, 'ready', 'placement_sticky',
+                \\       '{"selected":true,"sticky":true}', ?
+                \\FROM workload_assignments
+                \\WHERE deployment_name=? AND state NOT IN ('pending', 'blocked', 'stopped')
+                \\ON CONFLICT(deployment_name, node_id) DO UPDATE SET
+                \\  revision=excluded.revision, status='ready',
+                \\  reason_code='placement_sticky', reason_detail=excluded.reason_detail,
+                \\  updated_unix_ms=excluded.updated_unix_ms;
+            );
+            defer preserve_active.finalize();
+            try preserve_active.bindInt64(1, @intCast(deployment.revision));
+            try preserve_active.bindInt64(2, now_unix_ms);
+            try preserve_active.bindText(3, deployment.name);
+            try preserve_active.done();
+        }
+
         var clear_assignments = try self.prepare("DELETE FROM workload_assignments WHERE deployment_name=?;");
         defer clear_assignments.finalize();
         try clear_assignments.bindText(1, deployment.name);
@@ -666,6 +690,9 @@ pub const Registry = struct {
         defer clear_untargeted_decisions.finalize();
         try clear_untargeted_decisions.bindText(1, deployment.name);
         try clear_untargeted_decisions.done();
+
+        if (deployment.placement != null)
+            try self.schedulePlacement(deployment, now_unix_ms);
 
         try self.audit(now_unix_ms, "", "deployment.applied", deployment.name);
         try self.exec("COMMIT;");
@@ -910,6 +937,10 @@ pub const Registry = struct {
             node_report.value.features,
             heartbeat.feature_artifact_variants_v1,
         );
+        const supports_edge_placement = hasFeature(
+            node_report.value.features,
+            heartbeat.feature_edge_placement_v1,
+        );
 
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -978,7 +1009,18 @@ pub const Registry = struct {
             const rollout_status = try self.allocator.dupe(u8, deployments.columnText(6));
             defer self.allocator.free(rollout_status);
 
-            const wave = try self.getOrCreateAssignmentWave(
+            var current_has_placement = false;
+            {
+                var current = try std.json.parseFromSlice(
+                    orchestration.Deployment,
+                    self.allocator,
+                    current_spec,
+                    .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+                );
+                defer current.deinit();
+                current_has_placement = current.value.placement != null;
+            }
+            var wave = try self.getOrCreateAssignmentWave(
                 name,
                 node_id,
                 batch_size,
@@ -986,6 +1028,17 @@ pub const Registry = struct {
                 rollout_status,
                 now_unix_ms,
             );
+            if (current_has_placement) {
+                if (!supports_edge_placement or !try self.placementSelected(name, node_id)) {
+                    if (supports_accelerator_lifecycle)
+                        try self.ensureLifecycleRelease(name, node_id, now_unix_ms);
+                    try self.releaseAcceleratorReservation(name, node_id);
+                    try self.markPlacementAssignmentUnselected(name, node_id, now_unix_ms);
+                    continue;
+                }
+                try self.rebuildPlacementWaves(name, @intCast(batch_size));
+                wave = try self.assignmentWave(name, node_id);
+            }
             const selected_spec = if (wave <= current_wave) current_spec else previous_spec orelse continue;
             var emitted_spec = selected_spec;
             var parsed_spec = try std.json.parseFromSlice(
@@ -998,6 +1051,8 @@ pub const Registry = struct {
             var parsed_fallback: ?std.json.Parsed(orchestration.Deployment) = null;
             defer if (parsed_fallback) |*parsed| parsed.deinit();
             var effective_spec = parsed_spec.value;
+            var owned_agent_spec: ?[]u8 = null;
+            defer if (owned_agent_spec) |value| self.allocator.free(value);
 
             if (parsed_spec.value.artifact_variants != null and
                 !supports_artifact_variants)
@@ -1019,6 +1074,34 @@ pub const Registry = struct {
                 if (parsed_fallback.?.value.artifact_variants != null) continue;
                 emitted_spec = fallback;
                 effective_spec = parsed_fallback.?.value;
+            }
+
+            if (effective_spec.placement != null) {
+                if (!supports_edge_placement or
+                    !try self.placementSelected(effective_spec.name, node_id))
+                {
+                    if (supports_accelerator_lifecycle)
+                        try self.ensureLifecycleRelease(
+                            effective_spec.name,
+                            node_id,
+                            now_unix_ms,
+                        );
+                    try self.releaseAcceleratorReservation(effective_spec.name, node_id);
+                    try self.markPlacementAssignmentUnselected(
+                        effective_spec.name,
+                        node_id,
+                        now_unix_ms,
+                    );
+                    continue;
+                }
+                var agent_spec = effective_spec;
+                agent_spec.placement = null;
+                owned_agent_spec = try std.json.Stringify.valueAlloc(
+                    self.allocator,
+                    agent_spec,
+                    .{ .emit_null_optional_fields = false },
+                );
+                emitted_spec = owned_agent_spec.?;
             }
 
             if (effective_spec.resources) |resources| {
@@ -1097,7 +1180,10 @@ pub const Registry = struct {
                         node_id,
                         now_unix_ms,
                     );
-                try self.releasePlacement(effective_spec.name, node_id);
+                if (effective_spec.placement != null)
+                    try self.releaseAcceleratorReservation(effective_spec.name, node_id)
+                else
+                    try self.releasePlacement(effective_spec.name, node_id);
             }
             if (!first) try output.append(self.allocator, ',');
             first = false;
@@ -1248,11 +1334,12 @@ pub const Registry = struct {
 
         var reserved = try self.loadLifecycleReservedIds(report.node_id, deployment.name);
         defer reserved.deinit();
-        const selected = accelerator.selectAlloc(
+        const selected = selectAcceleratorsAlloc(
             self.allocator,
             inventory,
             requirement,
             reserved.items,
+            deployment.placement,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return self.blockedPlacement(selectionReason(err)),
@@ -1643,11 +1730,12 @@ pub const Registry = struct {
 
         var reserved = try self.loadOtherReservationIds(report.node_id, deployment.name);
         defer reserved.deinit();
-        const selected = accelerator.selectAlloc(
+        const selected = selectAcceleratorsAlloc(
             self.allocator,
             inventory,
             requirement,
             reserved.items,
+            deployment.placement,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return self.blockedPlacement(selectionReason(err)),
@@ -1760,6 +1848,262 @@ pub const Registry = struct {
         return try query.row();
     }
 
+    fn reschedulePlacementDeployments(self: *Registry, now_unix_ms: i64) !void {
+        var deployments = try self.prepare(
+            "SELECT spec_json FROM deployments ORDER BY name;",
+        );
+        defer deployments.finalize();
+        while (try deployments.row()) {
+            var parsed = try std.json.parseFromSlice(
+                orchestration.Deployment,
+                self.allocator,
+                deployments.columnText(0),
+                .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+            );
+            defer parsed.deinit();
+            if (parsed.value.placement != null)
+                try self.schedulePlacement(parsed.value, now_unix_ms);
+        }
+    }
+
+    /// Persist one deterministic admission plan. Existing selections are
+    /// sticky: an offline node is never duplicated elsewhere without a signed
+    /// cross-node lease proving that its workload stopped.
+    fn schedulePlacement(
+        self: *Registry,
+        deployment: orchestration.Deployment,
+        now_unix_ms: i64,
+    ) !void {
+        const policy = deployment.placement orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var candidates: std.ArrayList(edge_placement.Candidate) = .empty;
+
+        var nodes = try self.prepare(
+            \\SELECT n.node_id, n.last_seen_unix_ms, n.report_json FROM nodes n
+            \\WHERE EXISTS (
+            \\        SELECT 1 FROM deployment_targets t
+            \\        WHERE t.deployment_name=? AND t.target_kind='all'
+            \\      )
+            \\   OR EXISTS (
+            \\        SELECT 1 FROM deployment_targets t
+            \\        WHERE t.deployment_name=? AND t.target_kind='node'
+            \\          AND t.target_value=n.node_id
+            \\      )
+            \\   OR EXISTS (
+            \\        SELECT 1 FROM deployment_targets t
+            \\        WHERE t.deployment_name=? AND t.target_kind='role'
+            \\          AND t.target_value=n.role
+            \\      )
+            \\   OR (
+            \\        EXISTS (SELECT 1 FROM deployment_label_targets lt
+            \\                WHERE lt.deployment_name=?)
+            \\        AND NOT EXISTS (
+            \\          SELECT 1 FROM deployment_label_targets lt
+            \\          WHERE lt.deployment_name=?
+            \\            AND NOT EXISTS (
+            \\              SELECT 1 FROM node_labels nl
+            \\              WHERE nl.node_id=n.node_id AND nl.label_key=lt.label_key
+            \\                AND nl.label_value=lt.label_value
+            \\            )
+            \\        )
+            \\      )
+            \\ORDER BY n.node_id;
+        );
+        defer nodes.finalize();
+        for (1..6) |index| try nodes.bindText(@intCast(index), deployment.name);
+        while (try nodes.row()) {
+            const node_id = try allocator.dupe(u8, nodes.columnText(0));
+            const report_json = try allocator.dupe(u8, nodes.columnText(2));
+            const report = std.json.parseFromSliceLeaky(
+                heartbeat.Heartbeat,
+                allocator,
+                report_json,
+                .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+            ) catch continue;
+            var supports_placement = false;
+            for (report.features) |feature| {
+                if (std.mem.eql(u8, feature, heartbeat.feature_edge_placement_v1)) {
+                    supports_placement = true;
+                    break;
+                }
+            }
+            var other_reservations = try self.loadOtherReservationIds(
+                node_id,
+                deployment.name,
+            );
+            defer other_reservations.deinit();
+            var device_metrics: std.ArrayList(edge_placement.DeviceTelemetry) = .empty;
+            if (deployment.resources) |resources| {
+                if (report.accelerator_inventory) |inventory| {
+                    for (inventory.accelerators) |device| {
+                        if (!accelerator.matchesRequirement(device, resources.accelerators)) continue;
+                        var reserved = false;
+                        for (other_reservations.items) |reserved_id| {
+                            if (std.mem.eql(u8, reserved_id, device.id)) {
+                                reserved = true;
+                                break;
+                            }
+                        }
+                        if (reserved) continue;
+                        try device_metrics.append(allocator, .{
+                            .id = device.id,
+                            .memory_free_bytes = device.memory_free_bytes,
+                            .temperature_millicelsius = device.temperature_millicelsius,
+                            .power_draw_milliwatts = device.power_draw_milliwatts,
+                        });
+                    }
+                }
+            }
+            try candidates.append(allocator, .{
+                .node_id = node_id,
+                .last_seen_unix_ms = nodes.columnInt64(1),
+                .supports_placement = supports_placement,
+                .accelerator_inventory_complete = if (report.accelerator_inventory) |inventory|
+                    inventory.status == .complete
+                else
+                    false,
+                .telemetry = report.placement_telemetry,
+                .devices = device_metrics.items,
+                .required_device_count = if (deployment.resources) |resources|
+                    resources.accelerators.count
+                else
+                    0,
+            });
+        }
+
+        var artifact_digests: [33][]const u8 = undefined;
+        var digest_count: usize = 0;
+        if (deployment.artifact) |artifact| {
+            artifact_digests[digest_count] = artifact.sha256;
+            digest_count += 1;
+        }
+        if (deployment.artifact_variants) |variants| for (variants) |variant| {
+            artifact_digests[digest_count] = variant.artifact.sha256;
+            digest_count += 1;
+        };
+        const ranked = try edge_placement.rankAlloc(
+            allocator,
+            candidates.items,
+            policy,
+            artifact_digests[0..digest_count],
+            now_unix_ms,
+        );
+
+        var selected_query = try self.prepare(
+            "SELECT COUNT(*) FROM placement_decisions WHERE deployment_name=? AND status='ready';",
+        );
+        defer selected_query.finalize();
+        try selected_query.bindText(1, deployment.name);
+        _ = try selected_query.row();
+        var selected_count: usize = @intCast(selected_query.columnInt64(0));
+        for (ranked) |entry| {
+            const sticky = try self.wasPlacementSelected(
+                deployment.name,
+                entry.candidate.node_id,
+            );
+            const has_capacity = if (policy.replicas) |replicas|
+                selected_count < replicas
+            else
+                true;
+            const is_selected = sticky or (entry.evaluation.eligible and has_capacity);
+            if (!sticky and is_selected) selected_count += 1;
+            const reason = if (sticky)
+                "placement_sticky"
+            else if (is_selected)
+                "placement_selected"
+            else if (entry.evaluation.eligible)
+                "not_selected_lower_rank"
+            else
+                entry.evaluation.reason_code;
+            const detail = try edge_placement.detailAlloc(allocator, entry, is_selected);
+            try self.recordPlacementDecisionDetail(
+                deployment,
+                entry.candidate.node_id,
+                is_selected,
+                reason,
+                detail,
+                now_unix_ms,
+                if (is_selected) null else -1,
+            );
+        }
+        try self.rebuildPlacementWaves(deployment.name, deployment.rollout.batch_size);
+    }
+
+    fn rebuildPlacementWaves(
+        self: *Registry,
+        deployment_name: []const u8,
+        batch_size: u32,
+    ) !void {
+        var selected_nodes: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (selected_nodes.items) |node_id| self.allocator.free(node_id);
+            selected_nodes.deinit(self.allocator);
+        }
+        {
+            var selected = try self.prepare(
+                \\SELECT node_id FROM placement_decisions
+                \\WHERE deployment_name=? AND status='ready' ORDER BY node_id;
+            );
+            defer selected.finalize();
+            try selected.bindText(1, deployment_name);
+            while (try selected.row())
+                try selected_nodes.append(
+                    self.allocator,
+                    try self.allocator.dupe(u8, selected.columnText(0)),
+                );
+        }
+        for (selected_nodes.items, 0..) |node_id, index| {
+            var update = try self.prepare(
+                "UPDATE workload_assignments SET wave=? WHERE deployment_name=? AND node_id=?;",
+            );
+            defer update.finalize();
+            try update.bindInt64(1, @intCast(index / batch_size));
+            try update.bindText(2, deployment_name);
+            try update.bindText(3, node_id);
+            try update.done();
+        }
+    }
+
+    fn assignmentWave(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+    ) !i64 {
+        var query = try self.prepare(
+            "SELECT wave FROM workload_assignments WHERE deployment_name=? AND node_id=?;",
+        );
+        defer query.finalize();
+        try query.bindText(1, deployment_name);
+        try query.bindText(2, node_id);
+        if (!try query.row()) return error.InconsistentPlacementAssignment;
+        return query.columnInt64(0);
+    }
+
+    fn wasPlacementSelected(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+    ) !bool {
+        var selected = try self.prepare(
+            \\SELECT 1 FROM placement_decisions
+            \\WHERE deployment_name=? AND node_id=? AND status='ready';
+        );
+        defer selected.finalize();
+        try selected.bindText(1, deployment_name);
+        try selected.bindText(2, node_id);
+        return try selected.row();
+    }
+
+    fn placementSelected(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+    ) !bool {
+        return self.wasPlacementSelected(deployment_name, node_id);
+    }
+
     fn recordPlacementDecision(
         self: *Registry,
         deployment: orchestration.Deployment,
@@ -1768,14 +2112,36 @@ pub const Registry = struct {
         reason_code: []const u8,
         now_unix_ms: i64,
     ) !void {
+        if (deployment.placement != null and is_ready and reason_code.len == 0) return;
+        return self.recordPlacementDecisionDetail(
+            deployment,
+            node_id,
+            is_ready,
+            reason_code,
+            "",
+            now_unix_ms,
+            null,
+        );
+    }
+
+    fn recordPlacementDecisionDetail(
+        self: *Registry,
+        deployment: orchestration.Deployment,
+        node_id: []const u8,
+        is_ready: bool,
+        reason_code: []const u8,
+        reason_detail: []const u8,
+        now_unix_ms: i64,
+        assignment_wave: ?i64,
+    ) !void {
         var upsert = try self.prepare(
             \\INSERT INTO placement_decisions (
             \\  deployment_name, node_id, revision, status, reason_code,
             \\  reason_detail, updated_unix_ms
-            \\) VALUES (?, ?, ?, ?, ?, '', ?)
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?)
             \\ON CONFLICT(deployment_name, node_id) DO UPDATE SET
             \\  revision=excluded.revision, status=excluded.status,
-            \\  reason_code=excluded.reason_code, reason_detail='',
+            \\  reason_code=excluded.reason_code, reason_detail=excluded.reason_detail,
             \\  updated_unix_ms=excluded.updated_unix_ms;
         );
         defer upsert.finalize();
@@ -1784,34 +2150,32 @@ pub const Registry = struct {
         try upsert.bindInt64(3, @intCast(deployment.revision));
         try upsert.bindText(4, if (is_ready) "ready" else "unschedulable");
         try upsert.bindText(5, reason_code);
-        try upsert.bindInt64(6, now_unix_ms);
+        try upsert.bindText(6, reason_detail);
+        try upsert.bindInt64(7, now_unix_ms);
         try upsert.done();
 
         const assignment_state = if (is_ready) "pending" else "blocked";
         const assignment_message = if (is_ready) "" else reason_code;
         var update_assignment = try self.prepare(
-            \\UPDATE workload_assignments SET state=?, message=?, updated_unix_ms=?
+            \\UPDATE workload_assignments SET wave=COALESCE(?, wave), state=?, message=?, updated_unix_ms=?
             \\WHERE deployment_name=? AND node_id=?
-            \\  AND (state='pending' OR (?=0 AND state='blocked'));
+            \\  AND state IN ('pending', 'blocked');
         );
         defer update_assignment.finalize();
-        try update_assignment.bindText(1, assignment_state);
-        try update_assignment.bindText(2, assignment_message);
-        try update_assignment.bindInt64(3, now_unix_ms);
-        try update_assignment.bindText(4, deployment.name);
-        try update_assignment.bindText(5, node_id);
-        try update_assignment.bindInt64(6, @intFromBool(is_ready));
+        if (assignment_wave) |wave|
+            try update_assignment.bindInt64(1, wave)
+        else
+            try update_assignment.bindNull(1);
+        try update_assignment.bindText(2, assignment_state);
+        try update_assignment.bindText(3, assignment_message);
+        try update_assignment.bindInt64(4, now_unix_ms);
+        try update_assignment.bindText(5, deployment.name);
+        try update_assignment.bindText(6, node_id);
         try update_assignment.done();
     }
 
     fn releasePlacement(self: *Registry, deployment_name: []const u8, node_id: []const u8) !void {
-        var release = try self.prepare(
-            "DELETE FROM accelerator_reservations WHERE deployment_name=? AND node_id=?;",
-        );
-        defer release.finalize();
-        try release.bindText(1, deployment_name);
-        try release.bindText(2, node_id);
-        try release.done();
+        try self.releaseAcceleratorReservation(deployment_name, node_id);
         var clear_decision = try self.prepare(
             "DELETE FROM placement_decisions WHERE deployment_name=? AND node_id=?;",
         );
@@ -1819,6 +2183,38 @@ pub const Registry = struct {
         try clear_decision.bindText(1, deployment_name);
         try clear_decision.bindText(2, node_id);
         try clear_decision.done();
+    }
+
+    fn releaseAcceleratorReservation(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+    ) !void {
+        var release = try self.prepare(
+            "DELETE FROM accelerator_reservations WHERE deployment_name=? AND node_id=?;",
+        );
+        defer release.finalize();
+        try release.bindText(1, deployment_name);
+        try release.bindText(2, node_id);
+        try release.done();
+    }
+
+    fn markPlacementAssignmentUnselected(
+        self: *Registry,
+        deployment_name: []const u8,
+        node_id: []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        var update = try self.prepare(
+            \\UPDATE workload_assignments
+            \\SET wave=-1, state='blocked', message='placement_not_selected', updated_unix_ms=?
+            \\WHERE deployment_name=? AND node_id=? AND state IN ('pending', 'blocked');
+        );
+        defer update.finalize();
+        try update.bindInt64(1, now_unix_ms);
+        try update.bindText(2, deployment_name);
+        try update.bindText(3, node_id);
+        try update.done();
     }
 
     pub fn recordWorkloadStatus(
@@ -2380,7 +2776,9 @@ const DeploymentSummary = struct {
 
 const AssignmentSummary = struct {
     node_id: []const u8,
-    wave: u64,
+    /// Edge-placement candidates outside the selected replica set use -1 and
+    /// do not participate in rollout health gates.
+    wave: i64,
     state: []const u8,
     observed_revision: u64,
     message: []const u8,
@@ -2615,8 +3013,28 @@ fn selectionReason(err: accelerator.SelectionError) []const u8 {
         error.CapabilityMismatch => "accelerator_capability_missing",
         error.InsufficientDevices => "accelerator_count_insufficient",
         error.DeviceReserved => "accelerator_capacity_exhausted",
+        error.DynamicPolicyMismatch => "accelerator_dynamic_policy_mismatch",
         error.OutOfMemory => "out_of_memory",
     };
+}
+
+fn selectAcceleratorsAlloc(
+    allocator: std.mem.Allocator,
+    inventory: accelerator.InventoryReport,
+    requirement: accelerator.Requirement,
+    reserved_ids: []const []const u8,
+    policy: ?edge_placement.Policy,
+) accelerator.SelectionError![]const []const u8 {
+    return if (policy) |edge_policy|
+        accelerator.selectForPlacementAlloc(
+            allocator,
+            inventory,
+            requirement,
+            reserved_ids,
+            edge_policy,
+        )
+    else
+        accelerator.selectAlloc(allocator, inventory, requirement, reserved_ids);
 }
 
 fn logSqliteError(db: *c.sqlite3, operation: []const u8) void {
@@ -2776,6 +3194,175 @@ test "artifact variants are delivered only to agents that advertise support" {
     defer parsed_supported.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_supported.value.deployments.len);
     try std.testing.expect(parsed_supported.value.deployments[0].artifact_variants != null);
+}
+
+test "edge placement is deterministic sticky explainable and bounded" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const database_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_len], "placement.db" },
+    );
+    defer std.testing.allocator.free(database_path);
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, database_path);
+    defer registry.close();
+    const features = [_][]const u8{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+        heartbeat.feature_artifact_variants_v1,
+        heartbeat.feature_edge_placement_v1,
+    };
+    const digest = "ab" ** 32;
+    var report: heartbeat.Heartbeat = .{
+        .node_id = "edge-c",
+        .hostname = "edge-c",
+        .role = "edge",
+        .features = &features,
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 8 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &.{},
+            .probes = &.{.{
+                .name = "fixture",
+                .status = .not_present,
+                .devices_found = 0,
+            }},
+        },
+        .placement_telemetry = .{ .cost_microunits_per_hour = 10 },
+        .timestamp_unix_ms = 1000,
+    };
+    try recordLifecycleTestHeartbeat(&registry, report, 1000);
+    report.node_id = "edge-a";
+    report.hostname = "edge-a";
+    report.placement_telemetry = .{
+        .connectivity_quality_percent = 80,
+        .cost_microunits_per_hour = 20,
+        .cached_artifact_sha256 = &.{digest},
+    };
+    try recordLifecycleTestHeartbeat(&registry, report, 19_000);
+    report.node_id = "edge-b";
+    report.hostname = "edge-b";
+    report.placement_telemetry = .{
+        .connectivity_quality_percent = 100,
+        .cost_microunits_per_hour = 10,
+    };
+    try recordLifecycleTestHeartbeat(&registry, report, 19_100);
+    report.schema_version = 3;
+    report.node_id = "edge-legacy";
+    report.hostname = "edge-legacy";
+    report.features = &.{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_lifecycle_v1,
+    };
+    report.placement_telemetry = null;
+    try recordLifecycleTestHeartbeat(&registry, report, 19_200);
+    report.schema_version = heartbeat.current_schema_version;
+    report.node_id = "edge-b";
+    report.hostname = "edge-b";
+    report.features = &features;
+
+    const deployment: orchestration.Deployment = .{
+        .name = "edge-ranked",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"{artifact}"} },
+        .artifact = .{ .source = "file:///tmp/model", .sha256 = digest },
+        .placement = .{
+            .replicas = 1,
+            .max_offline_seconds = 5,
+            .max_cost_microunits_per_hour = 100,
+        },
+        .targets = .{ .all = true },
+    };
+    try applyLifecycleTestDeployment(&registry, deployment, 20_000);
+
+    const selected = (try registry.desiredStateForNode("edge-a", 20_100)).?;
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "\"name\":\"edge-ranked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "\"placement\"") == null);
+    const lower_rank = (try registry.desiredStateForNode("edge-b", 20_100)).?;
+    defer std.testing.allocator.free(lower_rank);
+    try std.testing.expect(std.mem.indexOf(u8, lower_rank, "\"name\":\"edge-ranked\"") == null);
+    const offline = (try registry.desiredStateForNode("edge-c", 20_100)).?;
+    defer std.testing.allocator.free(offline);
+    try std.testing.expect(std.mem.indexOf(u8, offline, "\"name\":\"edge-ranked\"") == null);
+
+    const inspected = (try registry.inspectDeployment("edge-ranked")).?;
+    defer std.testing.allocator.free(inspected);
+    try std.testing.expect(std.mem.indexOf(u8, inspected, "placement_selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected, "not_selected_lower_rank") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected, "node_offline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected, "agent_feature_unsupported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected, "\\\"cache_hit\\\":true") != null);
+
+    var waves = try registry.prepare(
+        \\SELECT node_id, wave FROM workload_assignments
+        \\WHERE deployment_name='edge-ranked' ORDER BY node_id;
+    );
+    defer waves.finalize();
+    while (try waves.row()) {
+        const expected_wave: i64 = if (std.mem.eql(u8, waves.columnText(0), "edge-a")) 0 else -1;
+        try std.testing.expectEqual(expected_wave, waves.columnInt64(1));
+    }
+    report.node_id = "edge-d";
+    report.hostname = "edge-d";
+    report.placement_telemetry = .{ .cost_microunits_per_hour = 30 };
+    try recordLifecycleTestHeartbeat(&registry, report, 20_120);
+    const late_unselected = (try registry.desiredStateForNode("edge-d", 20_130)).?;
+    defer std.testing.allocator.free(late_unselected);
+    try std.testing.expect(std.mem.indexOf(u8, late_unselected, "\"name\":\"edge-ranked\"") == null);
+    var late_wave = try registry.prepare(
+        "SELECT wave FROM workload_assignments WHERE deployment_name='edge-ranked' AND node_id='edge-d';",
+    );
+    defer late_wave.finalize();
+    try std.testing.expect(try late_wave.row());
+    try std.testing.expectEqual(@as(i64, -1), late_wave.columnInt64(0));
+    try std.testing.expect(try registry.recordWorkloadStatus(.{
+        .node_id = "edge-a",
+        .deployment = "edge-ranked",
+        .revision = 1,
+        .state = .healthy,
+        .observed_unix_ms = 20_150,
+    }, 20_150));
+    const completed = (try registry.inspectDeployment("edge-ranked")).?;
+    defer std.testing.allocator.free(completed);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\"status\":\"completed\"") != null);
+
+    // The persisted plan, not desired-state read order, survives a server restart.
+    registry.close();
+    registry = try Registry.open(std.testing.allocator, std.testing.io, database_path);
+    const after_restart = (try registry.desiredStateForNode("edge-a", 20_100)).?;
+    defer std.testing.allocator.free(after_restart);
+    try std.testing.expect(std.mem.indexOf(u8, after_restart, "\"name\":\"edge-ranked\"") != null);
+
+    // A newly better report cannot duplicate an already admitted singleton.
+    report.node_id = "edge-b";
+    report.hostname = "edge-b";
+    report.placement_telemetry = .{
+        .connectivity_quality_percent = 100,
+        .cost_microunits_per_hour = 1,
+        .cached_artifact_sha256 = &.{digest},
+    };
+    for (0..1000) |_| try recordLifecycleTestHeartbeat(&registry, report, 21_000);
+    const still_selected = (try registry.desiredStateForNode("edge-a", 21_100)).?;
+    defer std.testing.allocator.free(still_selected);
+    try std.testing.expect(std.mem.indexOf(u8, still_selected, "\"name\":\"edge-ranked\"") != null);
+    const still_lower = (try registry.desiredStateForNode("edge-b", 21_100)).?;
+    defer std.testing.allocator.free(still_lower);
+    try std.testing.expect(std.mem.indexOf(u8, still_lower, "\"name\":\"edge-ranked\"") == null);
+
+    var decisions = try registry.prepare(
+        "SELECT COUNT(*) FROM placement_decisions WHERE deployment_name='edge-ranked';",
+    );
+    defer decisions.finalize();
+    try std.testing.expect(try decisions.row());
+    try std.testing.expectEqual(@as(i64, 5), decisions.columnInt64(0));
+    var history = try registry.prepare("SELECT COUNT(*) FROM heartbeat_history;");
+    defer history.finalize();
+    try std.testing.expect(try history.row());
+    try std.testing.expect(history.columnInt64(0) <= 5);
 }
 
 test "version one and accelerator inventory heartbeats coexist" {

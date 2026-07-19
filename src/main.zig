@@ -17,6 +17,7 @@ const heartbeat = @import("heartbeat.zig");
 const host_runtime = @import("host_runtime.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
+const placement = @import("placement.zig");
 const reconciler = @import("reconciler.zig");
 const reservation = @import("reservation.zig");
 const runtime = @import("runtime.zig");
@@ -40,6 +41,7 @@ const AgentOptions = struct {
     require_artifact_signatures: bool,
     max_artifact_bytes: u64,
     artifact_cache_bytes: u64,
+    placement_telemetry: placement.Telemetry,
     token: ?[]const u8,
     once: bool = false,
 };
@@ -158,6 +160,27 @@ fn defaultsForAgent(init: std.process.Init, file_config: config.FileConfig) !Age
             "NIMBUS_ARTIFACT_CACHE_BYTES",
             file_config.artifact_cache_bytes orelse 16 * 1024 * 1024 * 1024,
         ),
+        .placement_telemetry = .{
+            .connectivity_quality_percent = try percentValue(try config.envUnsigned(
+                init,
+                "NIMBUS_CONNECTIVITY_QUALITY_PERCENT",
+                file_config.connectivity_quality_percent orelse 100,
+            )),
+            .power_source = try placement.parsePowerSource(
+                init.environ_map.get("NIMBUS_POWER_SOURCE") orelse
+                    file_config.power_source orelse "unknown",
+            ),
+            .power_budget_milliwatts = try optionalUnsigned(
+                init,
+                "NIMBUS_POWER_BUDGET_MILLIWATTS",
+                file_config.power_budget_milliwatts,
+            ),
+            .cost_microunits_per_hour = try optionalUnsigned(
+                init,
+                "NIMBUS_COST_MICROUNITS_PER_HOUR",
+                file_config.cost_microunits_per_hour,
+            ),
+        },
         .token = default_token,
     };
 }
@@ -207,6 +230,26 @@ fn parseAgentOptions(
             options.max_artifact_bytes = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
         } else if (std.mem.eql(u8, arg, "--artifact-cache-bytes")) {
             options.artifact_cache_bytes = parseUnsigned(init, requireValue(init, args, &i, arg), arg);
+        } else if (std.mem.eql(u8, arg, "--connectivity-quality")) {
+            options.placement_telemetry.connectivity_quality_percent = percentValue(
+                parseUnsigned(init, requireValue(init, args, &i, arg), arg),
+            ) catch usageAndExit(init, "connectivity quality must be 0..100");
+        } else if (std.mem.eql(u8, arg, "--power-source")) {
+            options.placement_telemetry.power_source = placement.parsePowerSource(
+                requireValue(init, args, &i, arg),
+            ) catch usageAndExit(init, "invalid power source");
+        } else if (std.mem.eql(u8, arg, "--power-budget-milliwatts")) {
+            options.placement_telemetry.power_budget_milliwatts = parseUnsigned(
+                init,
+                requireValue(init, args, &i, arg),
+                arg,
+            );
+        } else if (std.mem.eql(u8, arg, "--cost-microunits-per-hour")) {
+            options.placement_telemetry.cost_microunits_per_hour = parseUnsigned(
+                init,
+                requireValue(init, args, &i, arg),
+                arg,
+            );
         } else if (std.mem.eql(u8, arg, "--token")) {
             options.token = requireValue(init, args, &i, "--token");
         } else if (std.mem.eql(u8, arg, "--token-file")) {
@@ -230,6 +273,8 @@ fn parseAgentOptions(
     if (options.max_artifact_bytes == 0) usageAndExit(init, "max artifact bytes must be positive");
     if (options.artifact_cache_bytes < options.max_artifact_bytes)
         usageAndExit(init, "artifact cache bytes must be at least max artifact bytes");
+    if (!placement.validateTelemetry(options.placement_telemetry))
+        usageAndExit(init, "invalid edge placement telemetry");
     if (options.orchestration_enabled and !options.enabled_runtimes.any())
         usageAndExit(init, "--orchestrate requires at least one --runtimes value");
     if (options.require_artifact_signatures and options.artifact_public_key_hex == null)
@@ -282,6 +327,7 @@ fn runAgent(
             .max_artifact_cache_bytes = options.artifact_cache_bytes,
         },
         .token = options.token,
+        .placement_telemetry = options.placement_telemetry,
         .once = options.once,
     });
 }
@@ -641,6 +687,20 @@ fn parseUnsigned(init: std.process.Init, value: []const u8, option: []const u8) 
     };
 }
 
+fn optionalUnsigned(
+    init: std.process.Init,
+    environment_name: []const u8,
+    configured: ?u64,
+) !?u64 {
+    const value = init.environ_map.get(environment_name) orelse return configured;
+    return try std.fmt.parseInt(u64, value, 10);
+}
+
+fn percentValue(value: u64) !u8 {
+    if (value > 100) return error.InvalidPercent;
+    return @intCast(value);
+}
+
 fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
     if (message) |text| {
         Io.File.stderr().writeStreamingAll(init.io, text) catch {};
@@ -658,6 +718,8 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\                   [--state-dir PATH]
         \\                   [--artifact-public-key HEX] [--require-artifact-signatures]
         \\                   [--max-artifact-bytes BYTES] [--artifact-cache-bytes BYTES]
+        \\                   [--connectivity-quality PERCENT] [--power-source SOURCE]
+        \\                   [--power-budget-milliwatts MW] [--cost-microunits-per-hour COST]
         \\  nimbus server [--bind ADDRESS] [--port PORT] [--database PATH]
         \\                [--stale-after SEC] [--token TOKEN | --token-file PATH]
         \\                [--admin-token TOKEN | --admin-token-file PATH]
@@ -680,6 +742,8 @@ fn usageAndExit(init: std.process.Init, message: ?[]const u8) noreturn {
         \\NIMBUS_ORCHESTRATION, NIMBUS_RUNTIMES, NIMBUS_STATE_DIR,
         \\NIMBUS_ARTIFACT_PUBLIC_KEY, NIMBUS_REQUIRE_ARTIFACT_SIGNATURES,
         \\NIMBUS_MAX_ARTIFACT_BYTES, NIMBUS_ARTIFACT_CACHE_BYTES,
+        \\NIMBUS_CONNECTIVITY_QUALITY_PERCENT, NIMBUS_POWER_SOURCE,
+        \\NIMBUS_POWER_BUDGET_MILLIWATTS, NIMBUS_COST_MICROUNITS_PER_HOUR,
         \\NIMBUS_ADMIN_TOKEN, NIMBUS_ADMIN_TOKEN_FILE,
         \\and NIMBUS_ALLOW_INSECURE_NO_AUTH.
         \\
@@ -703,6 +767,7 @@ test {
     _ = host_runtime;
     _ = identity;
     _ = orchestration;
+    _ = placement;
     _ = reconciler;
     _ = reservation;
     _ = runtime;

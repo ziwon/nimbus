@@ -2,13 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const accelerator = @import("accelerator.zig");
+const placement = @import("placement.zig");
 
-pub const current_schema_version: u8 = 3;
+pub const current_schema_version: u8 = 4;
 pub const max_feature_count: usize = 16;
 pub const max_feature_name_length: usize = 64;
 pub const feature_accelerator_requirements_v1 = "accelerator-requirements-v1";
 pub const feature_accelerator_lifecycle_v1 = "accelerator-lifecycle-v1";
 pub const feature_artifact_variants_v1 = "artifact-variants-v1";
+pub const feature_edge_placement_v1 = "edge-placement-v1";
 
 pub const Heartbeat = struct {
     schema_version: u8 = current_schema_version,
@@ -20,6 +22,7 @@ pub const Heartbeat = struct {
     platform: Platform,
     resources: Resources,
     accelerator_inventory: ?accelerator.InventoryReport = null,
+    placement_telemetry: ?placement.Telemetry = null,
     timestamp_unix_ms: i64,
     agent_version: []const u8 = build_options.version,
 };
@@ -47,6 +50,26 @@ pub fn collect(
     features: []const []const u8,
     accelerator_inventory: accelerator.InventoryReport,
 ) Heartbeat {
+    return collectWithPlacement(
+        init,
+        node_id,
+        role,
+        labels,
+        features,
+        accelerator_inventory,
+        null,
+    );
+}
+
+pub fn collectWithPlacement(
+    init: std.process.Init,
+    node_id: []const u8,
+    role: []const u8,
+    labels: []const Label,
+    features: []const []const u8,
+    accelerator_inventory: accelerator.InventoryReport,
+    placement_telemetry: ?placement.Telemetry,
+) Heartbeat {
     const hostname = detectHostname(init);
 
     return .{
@@ -64,6 +87,7 @@ pub fn collect(
             .cpu_count = std.Thread.getCpuCount() catch 0,
         },
         .accelerator_inventory = accelerator_inventory,
+        .placement_telemetry = placement_telemetry,
         .timestamp_unix_ms = std.Io.Clock.real.now(init.io).toMilliseconds(),
     };
 }
