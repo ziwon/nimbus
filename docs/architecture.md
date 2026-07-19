@@ -266,7 +266,8 @@ concurrently through `std.Io.Group`, bounded to 64 active handlers with a
 15-second request deadline. An I/O-aware registry mutex serializes use of the
 shared SQLite connection and protects multi-statement transactions. Current node
 state is updated on every heartbeat; history is sampled every five minutes and
-retained for seven days. Audit events are retained for 30 days.
+retained for seven days. Audit events and workload status history are retained
+for 30 days.
 
 This architecture handles overlapping edge requests without claiming
 horizontal control-plane scale. One server process and one database remain the
@@ -298,7 +299,6 @@ shared node token allows node impersonation by another token holder.
 ## Known limitations
 
 - One SQLite control plane; no replication, leader election, or failover.
-- No retention/compaction policy for workload status history.
 - No rollout deadline or automatic skip for an offline current-wave node.
 - No resource-aware placement or capacity admission.
 - No ports, mounts, devices, GPU, network, secret, or resource-limit schema.

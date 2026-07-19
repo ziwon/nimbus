@@ -258,9 +258,9 @@ nimbus deployments rollback NAME
 
 `inspect` returns rollout configuration, the canonical specification, and each
 node assignment with wave, observed revision, state, message, and update time.
-The complete workload status history is retained in SQLite for future querying
-but does not yet have a dedicated CLI endpoint or retention policy. Heartbeat
-history is separately sampled and retained for seven days.
+Workload status history is retained in SQLite for 30 days for future querying
+but does not yet have a dedicated CLI endpoint. Heartbeat history is separately
+sampled and retained for seven days.
 
 ## Production boundaries
 

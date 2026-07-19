@@ -8,6 +8,7 @@ const c = @cImport({
 const heartbeat_sample_ms: i64 = 5 * 60 * 1000;
 const heartbeat_retention_ms: i64 = 7 * 24 * 60 * 60 * 1000;
 const audit_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
+const workload_status_retention_ms: i64 = 30 * 24 * 60 * 60 * 1000;
 
 pub const Registry = struct {
     db: *c.sqlite3,
@@ -704,6 +705,13 @@ pub const Registry = struct {
         try history.bindInt64(7, received_unix_ms);
         try history.done();
 
+        var prune_history = try self.prepare(
+            "DELETE FROM workload_status_history WHERE received_unix_ms < ?;",
+        );
+        defer prune_history.finalize();
+        try prune_history.bindInt64(1, received_unix_ms -| workload_status_retention_ms);
+        try prune_history.done();
+
         if (report.state == .failed or report.state == .degraded) {
             try self.handleUnavailable(report.deployment, received_unix_ms);
         } else if (report.state == .healthy or report.state == .stopped) {
@@ -1180,6 +1188,59 @@ test "node listing uses stable cursor pagination" {
     defer std.testing.allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"node_id\":\"edge-03\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"next_after\":null") != null);
+}
+
+test "workload status history is retained for thirty days" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const report: heartbeat.Heartbeat = .{
+        .node_id = "edge-01",
+        .hostname = "edge-01",
+        .role = "edge",
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 4 },
+        .timestamp_unix_ms = 1000,
+    };
+    const heartbeat_json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+    defer std.testing.allocator.free(heartbeat_json);
+    try registry.recordHeartbeat(report, heartbeat_json, 1000);
+
+    const deployment: orchestration.Deployment = .{
+        .name = "retention-test",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"/bin/true"} },
+        .targets = .{ .all = true },
+    };
+    const deployment_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        deployment,
+        .{},
+    );
+    defer std.testing.allocator.free(deployment_json);
+    try registry.applyDeployment(deployment, deployment_json, 1100);
+    const desired = (try registry.desiredStateForNode("edge-01", 1200)).?;
+    defer std.testing.allocator.free(desired);
+
+    try std.testing.expect(try registry.recordWorkloadStatus(.{
+        .node_id = "edge-01",
+        .deployment = "retention-test",
+        .revision = 1,
+        .state = .healthy,
+        .observed_unix_ms = 1300,
+    }, 1300));
+    const recent = workload_status_retention_ms + 2300;
+    try std.testing.expect(try registry.recordWorkloadStatus(.{
+        .node_id = "edge-01",
+        .deployment = "retention-test",
+        .revision = 1,
+        .state = .healthy,
+        .observed_unix_ms = recent,
+    }, recent));
+
+    var history = try registry.prepare("SELECT COUNT(*) FROM workload_status_history;");
+    defer history.finalize();
+    try std.testing.expect(try history.row());
+    try std.testing.expectEqual(@as(i64, 1), history.columnInt64(0));
 }
 
 test "desired state rolls out in waves and automatically rolls back" {
