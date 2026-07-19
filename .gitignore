@@ -6,3 +6,4 @@ nimbus.db-shm
 nimbus.db-wal
 .nimbus-node-id
 data/
+/docs/reviews/
