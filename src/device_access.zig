@@ -248,6 +248,47 @@ pub fn resolveAlloc(
     };
 }
 
+/// Resolve an assignment to an explicitly verified host allowlist even when
+/// CDI is also available. Process and systemd adapters cannot consume CDI, so
+/// silently preferring it would either broaden access or make their behavior
+/// depend on probe order.
+pub fn resolveHostAlloc(
+    allocator: std.mem.Allocator,
+    inventory_device_ids: []const []const u8,
+    catalog: Catalog,
+    assignment_device_ids: []const []const u8,
+) ResolveError!OwnedPlan {
+    try validateCatalog(inventory_device_ids, catalog);
+    if (assignment_device_ids.len == 0) return error.NoAssignedDevices;
+    if (assignment_device_ids.len > max_devices) return error.TooManyAssignedDevices;
+
+    var selected: [max_devices]LocalBinding = undefined;
+    for (assignment_device_ids, 0..) |device_id, index| {
+        if (!isValidDeviceId(device_id)) return error.InvalidAssignedDeviceId;
+        if (containsString(assignment_device_ids[0..index], device_id))
+            return error.DuplicateAssignedDevice;
+        if (!containsString(inventory_device_ids, device_id))
+            return error.AssignmentUnknownDevice;
+        selected[index] = findBinding(catalog.bindings, device_id) orelse
+            return error.MissingBinding;
+    }
+
+    const owned_device_ids = try cloneSortedStrings(allocator, assignment_device_ids);
+    errdefer freeStrings(allocator, owned_device_ids);
+    const host_access = try buildHostPlan(
+        allocator,
+        selected[0..assignment_device_ids.len],
+    );
+    errdefer deinitHostAccess(allocator, host_access);
+    const access: Access = .{ .host = host_access };
+    return .{
+        .allocator = allocator,
+        .device_ids = owned_device_ids,
+        .access = access,
+        .fingerprint = fingerprintPlan(owned_device_ids, access),
+    };
+}
+
 pub fn isValidDeviceId(value: []const u8) bool {
     if (value.len == 0 or value.len > max_device_id_bytes or value[0] == '-') return false;
     for (value) |byte| {
@@ -940,6 +981,32 @@ test "verified host access merges canonical paths and equal environment" {
     try std.testing.expectEqual(Permissions.read_write, host.device_nodes[2].permissions);
     try std.testing.expectEqual(@as(usize, 1), host.environment.len);
     try std.testing.expectEqualStrings("CUDA_VISIBLE_DEVICES", host.environment[0].name);
+}
+
+test "host resolver does not silently select CDI for host runtimes" {
+    const inventory = [_][]const u8{"gpu:a"};
+    const bindings = [_]LocalBinding{.{
+        .device_id = "gpu:a",
+        .cdi_devices = &.{"nvidia.com/gpu=GPU-a"},
+        .host_access = .{
+            .completeness = .vendor_verified,
+            .device_nodes = &.{.{ .path = "/dev/nvidia0", .permissions = .read_write }},
+            .environment = &.{.{ .name = "CUDA_VISIBLE_DEVICES", .value = "GPU-a" }},
+        },
+    }};
+    var plan = try resolveHostAlloc(
+        std.testing.allocator,
+        &inventory,
+        .{ .bindings = &bindings },
+        &inventory,
+    );
+    defer plan.deinit();
+    const host = switch (plan.access) {
+        .host => |access| access,
+        .cdi => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(usize, 1), host.device_nodes.len);
+    try std.testing.expectEqualStrings("/dev/nvidia0", host.device_nodes[0].path);
 }
 
 test "conflicting environment values reject host merge" {
