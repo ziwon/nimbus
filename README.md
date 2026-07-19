@@ -14,6 +14,7 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - bounded NVIDIA and Jetson accelerator discovery with opaque stable IDs;
 - declarative accelerator requirements with exclusive logical reservations;
 - generation-fenced accelerator execution with exact CDI/runtime handles;
+- deterministic platform/accelerator artifact variants and a pinned local cache;
 - a versioned desired-state and reconciliation loop;
 - opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
 - batched rollout, health gates, status history, and automatic rollback;
@@ -141,6 +142,7 @@ Every operational command accepts a JSON configuration file with `--config`:
   "artifact_public_key": "HEX_ENCODED_ED25519_PUBLIC_KEY",
   "require_artifact_signatures": true,
   "max_artifact_bytes": 8589934592,
+  "artifact_cache_bytes": 17179869184,
   "token_file": "/run/secrets/nimbus-node-token",
   "admin_token_file": "/run/secrets/nimbus-admin-token",
   "bind": "127.0.0.1",
@@ -163,7 +165,7 @@ then built-in default. Supported environment variables include:
   `NIMBUS_STALE_AFTER_SECONDS`, and `NIMBUS_ALLOW_INSECURE_NO_AUTH`;
 - `NIMBUS_ORCHESTRATION`, `NIMBUS_RUNTIMES`, `NIMBUS_STATE_DIR`,
   `NIMBUS_ARTIFACT_PUBLIC_KEY`, `NIMBUS_REQUIRE_ARTIFACT_SIGNATURES`, and
-  `NIMBUS_MAX_ARTIFACT_BYTES`.
+  `NIMBUS_MAX_ARTIFACT_BYTES`, and `NIMBUS_ARTIFACT_CACHE_BYTES`.
 
 Use separate configuration files for the server/operator and agent in real
 deployments so the administrative token is never copied to managed nodes.

@@ -311,6 +311,21 @@ confirms the exact device.
 
 ### A4 — Model lifecycle
 
+**Status: software complete (2026-07-19).** Deployments can declare bounded,
+named platform and accelerator variants with explicit fallbacks. Agents
+advertise `artifact-variants-v1`, select by compatibility/specificity with a
+lexical tie-break, and persist the selected variant in the fenced operation
+journal. Variant signatures bind the source, digest, compatibility selector,
+capabilities, and fallback bit. Verified files enter a size-bounded SHA-256
+content store; atomic per-deployment pins prevent active eviction. CPU and
+accelerator reconciliation preflight download, digest, signature, and cache
+admission before stopping the active runtime. Failure reports retain stable
+error names, feed the existing rollout policy, and allow a newer rollback
+generation to reuse the fenced claim. Unit tests cover CPU, Jetson, GPU,
+fallback, selection recovery, cache pressure, signature metadata, feature
+negotiation, no-handle release, and rollback recovery. Artifact transport is
+still limited to absolute `file://` and plain `http://` sources.
+
 - variant selection is deterministic and tested across CPU, Jetson, and GPU;
 - cache eviction never removes an active artifact;
 - signature failure prevents activation and triggers rollout failure policy.

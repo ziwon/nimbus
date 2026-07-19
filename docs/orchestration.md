@@ -267,8 +267,51 @@ its local workload during its next successful reconciliation.
 
 Process artifacts support absolute `file://` and plain `http://` sources. The
 agent streams into a temporary file while enforcing `max_artifact_bytes`,
-verifies SHA-256, marks the file executable, and atomically renames it into a
-revision-specific path. A digest mismatch never replaces the cached artifact.
+verifies SHA-256, marks the file executable, and atomically admits it into
+`artifacts/sha256/<digest>` below the state directory. The cache is bounded by
+`artifact_cache_bytes` (default 16 GiB), which must be at least
+`max_artifact_bytes`. Unpinned objects are evicted in digest lexical order;
+an atomic per-deployment pin prevents eviction of an active artifact.
+
+A deployment may use either one `artifact` or named `artifact_variants`, never
+both. Selectors can constrain OS, architecture, ABI, accelerator kind, vendor,
+model, and a canonical capability list. Nimbus chooses the compatible primary
+with the greatest selector specificity and uses lexical variant name order as
+the final tie-break. A `fallback` variant is considered only when no primary is
+compatible. Digest or signature failure never causes a silent fallback.
+
+```json
+"artifact_variants": [
+  {
+    "name": "jetson-orin",
+    "artifact": {
+      "source": "http://artifacts.internal/vision-orin",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "signature_ed25519": "HEX_SIGNATURE"
+    },
+    "selector": {
+      "os": "linux",
+      "arch": "aarch64",
+      "accelerator_kind": "gpu",
+      "accelerator_vendor": "nvidia",
+      "accelerator_capabilities": ["fp16"]
+    }
+  },
+  {
+    "name": "portable-cpu",
+    "artifact": {
+      "source": "http://artifacts.internal/vision-portable",
+      "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    },
+    "fallback": true
+  }
+]
+```
+
+Preflight selection, transfer, digest/signature verification, and cache
+admission complete before the current runtime is stopped. The chosen variant
+name is stored in `accelerator-journal.json`, so crash recovery cannot rerun
+tie-breaking within the same allocation generation.
 
 For signature enforcement, sign the lowercase 64-character SHA-256 string with
 Ed25519, put the hex signature in `signature_ed25519`, and configure agents with:
@@ -277,10 +320,14 @@ Ed25519, put the hex signature in `signature_ed25519`, and configure agents with
 --artifact-public-key HEX_PUBLIC_KEY --require-artifact-signatures
 ```
 
-The public key is 32 bytes encoded as 64 hex characters; the signature is 64
-bytes encoded as 128 hex characters. Digest pinning is always required for an
-artifact. Signature enforcement is an agent-side policy, so a compromised
-control plane cannot disable it in desired state.
+The digest-only message remains the format for the legacy single `artifact`.
+For a named variant, the Ed25519 message is the domain-separated
+`nimbus.artifact-variant.v1` binary descriptor with big-endian length-prefixed
+variant name, source, lowercase digest, selector fields and capabilities,
+followed by the fallback bit. This binds compatibility metadata as well as
+content. The public key is 32 bytes encoded as 64 hex characters; the signature
+is 64 bytes encoded as 128 hex characters. Signature enforcement is an
+agent-side policy, so desired state cannot disable it.
 
 ## Authentication and transport
 

@@ -29,7 +29,7 @@ Nimbus currently provides:
 - process, systemd, Docker, and containerd/nerdctl adapters behind an allowlist;
 - runtime, HTTP, TCP, and direct-command health checks;
 - deterministic batched rollout, health gates, pause, and rollback;
-- SHA-256 artifact verification and optional Ed25519 enforcement;
+- deterministic artifact variants, SHA-256 cache pinning, and Ed25519 enforcement;
 - SQLite-backed specifications, assignments, current state, history, and audit;
 - concurrent HTTP connections with serialized database transactions;
 - separate node/operator bearer tokens when configured;
@@ -109,6 +109,8 @@ flowchart TB
     AcceleratorAgent[accelerator_agent.zig<br/>production lifecycle hooks]
     AcceleratorReconcile[accelerator_reconciler.zig<br/>fenced state machine]
     AcceleratorRuntime[accelerator_runtime.zig<br/>exact runtime handles]
+    ArtifactSelector[artifact_selector.zig<br/>compatible variant choice]
+    ArtifactCache[artifact_cache.zig<br/>content store and pins]
     Runtime[runtime.zig<br/>adapters and artifacts]
     Protocol[orchestration.zig<br/>schema and validation]
     Client[client.zig<br/>HTTP client]
@@ -131,6 +133,8 @@ flowchart TB
     Reconcile --> AcceleratorAgent
     AcceleratorAgent --> AcceleratorReconcile
     AcceleratorAgent --> AcceleratorRuntime
+    AcceleratorAgent --> ArtifactSelector
+    Runtime --> ArtifactCache
     Reconcile --> Client
     Server --> Protocol
     Server --> Storage
@@ -152,7 +156,9 @@ flowchart TB
 | `accelerator_reconciler.zig` | Generation-fenced run, restart, rollback, and release state machine |
 | `accelerator_runtime.zig` | Exact CDI, container-ID, systemd, and host-device adapters |
 | `accelerator_agent.zig` | Agent HTTP, artifact, inventory-plan, and journal effect bindings |
-| `runtime.zig` | Runtime adapters, artifact streaming, digest/signature checks |
+| `artifact_selector.zig` | Pure compatibility, specificity, fallback, and lexical tie-breaking |
+| `artifact_cache.zig` | Size-bounded SHA-256 content storage, deterministic eviction, and active pins |
+| `runtime.zig` | Runtime adapters, artifact preflight, streaming, cache, and signature checks |
 | `client.zig` | Authenticated JSON HTTP requests |
 | `server.zig` | Concurrent connection handling, routing, auth, and body limits |
 | `storage.zig` | Transactions, rollout state machine, persistence, and queries |
@@ -193,6 +199,10 @@ names. Current agents emit v3 with `accelerator-requirements-v1`. Linux agents
 also emit `accelerator-lifecycle-v1` only when orchestration and a runtime are
 enabled. Servers must be upgraded before agents because older servers reject
 newer heartbeat schemas.
+
+Linux process agents additionally advertise `artifact-variants-v1`. The
+control plane omits variant specifications for agents without that feature,
+which preserves strict JSON compatibility during rolling upgrades.
 The server stores both agent time and server receipt time. Online/stale state is
 derived from receipt time, avoiding trust in device clock accuracy.
 
