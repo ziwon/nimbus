@@ -157,7 +157,7 @@ the latest role and labels when rebuilding assignments.
 The declaration describes hardware compatibility; labels continue to describe
 operator intent such as site or device class.
 
-Heartbeat v3 and v4 agents advertise `accelerator-requirements-v1`. For each
+Heartbeat v3 and later agents advertise `accelerator-requirements-v1`. For each
 matching node, the control plane filters the normalized inventory, excludes IDs
 reserved by other deployments, sorts compatible IDs lexically, and reserves the
 required count atomically. The database uniqueness key is
@@ -186,11 +186,12 @@ closed and keeps the claim.
 `placement` is optional. Without it, every target remains eligible as before.
 With it, `replicas` selects the best N nodes from the explicit target pool; a
 null `replicas` retains every eligible target. Agents negotiate
-`edge-placement-v1` in heartbeat v4 and report bounded current telemetry. The
-agent configuration and equivalent flags/environment variables can declare
-connectivity quality, `unknown`/`mains`/`battery` power source, available power
-budget, and hourly cost in operator-defined microunits. NVIDIA discovery also
-reports current free memory, temperature, and power draw when available.
+`edge-placement-v1` in heartbeat v4 and later and report bounded current
+telemetry. The agent configuration and equivalent flags/environment variables
+can declare connectivity quality, `unknown`/`mains`/`battery` power source,
+available power budget, and hourly cost in operator-defined microunits. NVIDIA
+discovery also reports current free memory, temperature, and power draw when
+available.
 
 Hard filters run in a fixed order: offline deadline, telemetry validity,
 connectivity, allowed power source, power budget, cost ceiling, accelerator free
@@ -379,19 +380,24 @@ agent-side policy, so desired state cannot disable it.
 
 ## Authentication and transport
 
-Use `--token`/`NIMBUS_TOKEN` or `--token-file`/`NIMBUS_TOKEN_FILE` for agent
-routes and the corresponding administrative options for operator routes. If no administrative
-token is configured, Nimbus falls back to the node token for compatibility.
-Production deployments should always separate them and keep the administrative
-credential off managed nodes.
+Use `--token`/`NIMBUS_TOKEN` or `--token-file`/`NIMBUS_TOKEN_FILE` on each
+agent and the corresponding administrative options for operator routes. On the
+server, `--node-token-dir`/`NIMBUS_NODE_TOKEN_DIR` enables exact node scope:
+the file named after a node ID contains that node's token and is reloaded for
+every request. Atomic file replacement performs immediate rotation. If no
+administrative token is configured, Nimbus falls back to the shared token only
+when the per-node directory is disabled. Production deployments should use
+per-node files, separate the administrative token, and keep it off managed
+nodes.
 
 Agents and the CLI can use HTTPS, while the embedded server listens on HTTP.
 Place it behind a TLS reverse proxy or a private authenticated network. A
+private proxy CA can be supplied as a PEM bundle through `NIMBUS_CA_FILE`. A
 non-loopback server without authentication fails closed unless the explicit
-insecure override is used. The shared node token does not provide
-per-device identity: any holder can submit status for another node ID. Per-node
-credentials, rotation, mTLS, scoped authorization, and signed desired-state
-documents remain future security work.
+insecure override is used. Shared-token compatibility does not provide
+per-device identity, so it should not be used for production fleets. Automated
+enrollment/revocation, mTLS, and signed desired-state documents remain future
+security work.
 
 ## Operational commands
 

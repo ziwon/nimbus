@@ -73,7 +73,8 @@ following foundation gates accelerator assignment:
 - bounded request duration and bounded server concurrency;
 - secret-file support rather than requiring credentials in process arguments;
 - heartbeat retention and paginated inventory;
-- per-node credentials and rotation before multi-tenant production use;
+- per-node credential files and reload-based rotation (implemented); automated
+  enrollment and revocation remain required before multi-tenant production use;
 - signed desired-state documents before privileged device assignment.
 
 Shared fleet tokens remain suitable only for small trusted deployments.
@@ -251,8 +252,8 @@ explicitly requests that behavior.
 - Device assignment is a privileged operation and requires a runtime allowlist.
 - Probe subprocesses have bounded execution, sanitized environments, and no
   shell interpolation.
-- Accelerator identifiers and telemetry are authenticated node claims; the
-  long-term design binds them to per-node credentials.
+- Accelerator identifiers and telemetry are authenticated node claims bound to
+  the exact node credential when the server uses `NIMBUS_NODE_TOKEN_DIR`.
 - Artifact signatures cover the selected variant and its compatibility
   metadata.
 - Reservation and deployment changes are audit events; utilization samples are

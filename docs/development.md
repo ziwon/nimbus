@@ -17,7 +17,7 @@ The repository currently expects:
 - Just 1.43 or newer;
 - Zig 0.16.0;
 - Git and ShellCheck for the check pipeline;
-- curl for local integration and container health checks;
+- curl, Python, and OpenSSL for local HTTP and HTTPS integration checks;
 - Docker for container recipes.
 
 Inspect the available tasks and local tools:
@@ -175,8 +175,9 @@ section.
 ### Compile-time target information
 
 `heartbeat.zig` imports `builtin` and derives OS, CPU architecture, and ABI from
-the selected compilation target. This means cross-built reports describe the
-artifact target without runtime platform tables.
+the selected compilation target. Heartbeat v5 also queries the running host
+architecture (`uname` on POSIX and `GetNativeSystemInfo` on Windows), so
+translated or emulated binaries remain distinguishable from their host.
 
 Platform-specific branches should use compile-time conditions where possible,
 as `shutdown.zig` does for POSIX signal registration.
@@ -274,12 +275,13 @@ For a backward-compatible additive field:
 
 For a breaking change, increment `schema_version` and define an explicit server
 compatibility policy before merging it. Do not silently reinterpret version 1.
-Heartbeat v4 is the current example: the server accepts v1 without accelerator
+Heartbeat v5 is the current example: the server accepts v1 without accelerator
 claims, v2 with a required validated inventory, v3 with bounded feature
-negotiation, and v4 with optional bounded placement telemetry. Current agents
-emit v4; orchestration-capable agents advertise `edge-placement-v1` and must
-include the matching telemetry. Deploy the compatible server first and agents
-second. Rolling the server back below v4 requires rolling agents back first.
+negotiation, v4 with optional bounded placement telemetry, and v5 with runtime
+host architecture. Current agents emit v5; orchestration-capable agents
+advertise `edge-placement-v1` and must include the matching telemetry. Deploy
+the compatible server first and agents second. Rolling the server back below
+v5 requires rolling agents back first.
 
 ## Changing desired-state or runtime behavior
 
@@ -354,6 +356,11 @@ oversized heartbeats, responsiveness while a slow client is connected, accepted
 heartbeat inspection, deterministic exclusive accelerator reservation, fenced
 run/release status transitions, release acknowledgement, and persistence across
 a server restart. `just integration` combines this with both end-to-end demos.
+
+`just auth-check` verifies exact per-node scope, shared-token bypass rejection,
+reload-based credential rotation, operator separation, and SIGTERM while a
+connection is active. `just https-check` exercises both an agent and operator
+CLI through a local TLS terminator using a generated private CA.
 
 `just orchestration-demo` additionally registers a target node, applies a
 deployment, reconciles a Linux process, verifies healthy assignment state,

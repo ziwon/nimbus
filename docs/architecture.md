@@ -191,20 +191,22 @@ without interpretation.
 ### Discovery and liveness
 
 The agent sends a schema-versioned heartbeat containing node ID, hostname,
-role, labels, compiled OS/architecture/ABI, CPU count, accelerator inventory,
-features, version, and timestamp. Heartbeat v2 introduced the distinction
-between a trustworthy empty `complete` inventory and `partial` or `unavailable`
-probe results. NVIDIA UUIDs are converted to node-scoped opaque hashes; Jetson
-GPU and DLA identities use stable functional slots.
+role, labels, compiled OS/architecture/ABI, runtime host architecture, CPU
+count, accelerator inventory, features, version, and timestamp. Heartbeat v2
+introduced the distinction between a trustworthy empty `complete` inventory
+and `partial` or `unavailable` probe results. NVIDIA UUIDs are converted to
+node-scoped opaque hashes; Jetson GPU and DLA identities use stable functional
+slots.
 
-The server accepts heartbeat versions 1 through 4 during rolling upgrades.
+The server accepts heartbeat versions 1 through 5 during rolling upgrades.
 Version 1 has no accelerator inventory, version 2 requires a bounded and
 internally consistent inventory, version 3 also carries negotiated feature
-names, and version 4 can carry bounded placement telemetry. Current agents emit
-v4. Orchestration-capable Linux agents advertise `edge-placement-v1` together
-with placement telemetry; the server requires the feature and telemetry to
-appear together. Servers must be upgraded before agents because older servers
-reject newer heartbeat schemas.
+names, version 4 can carry bounded placement telemetry, and version 5 adds the
+runtime host architecture while retaining the binary target architecture.
+Current agents emit v5. Orchestration-capable Linux agents advertise
+`edge-placement-v1` together with placement telemetry; the server requires the
+feature and telemetry to appear together. Servers must be upgraded before
+agents because older servers reject newer heartbeat schemas.
 
 Linux process agents additionally advertise `artifact-variants-v1`. The
 control plane omits variant specifications for agents without that feature,
@@ -381,12 +383,14 @@ uses the same recipes and ignores documentation-only changes.
 Implemented controls include strict schemas, prepared SQL, bounded requests,
 runtime allowlists, direct argv execution, immutable image references, artifact
 digests, optional signature enforcement, atomic state/artifact replacement, PID
-identity checks, and node/admin token separation.
+identity checks, node/admin token separation, and exact per-node credentials.
+The control plane reloads a node's token file on each request, allowing atomic
+credential rotation without restart. Shared-token compatibility remains
+available only when the per-node credential directory is not configured.
 
-Remaining security work includes TLS termination in the server, per-node credentials,
-credential rotation, mTLS, authorization scopes, signed desired-state
-documents, attestation, secret delivery, and sandbox/resource policy. The
-shared node token allows node impersonation by another token holder.
+Remaining security work includes native TLS termination, mTLS, automated
+credential enrollment and revocation, signed desired-state documents,
+attestation, secret delivery, and sandbox/resource policy.
 
 ## Known limitations
 

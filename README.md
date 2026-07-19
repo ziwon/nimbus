@@ -20,13 +20,15 @@ edge AI, intermediary, server, and cloud nodes. One binary provides:
 - opt-in process, systemd, Docker, and containerd (nerdctl) runtime adapters;
 - batched rollout, health gates, status history, and automatic rollback;
 - SHA-256 artifact verification with optional Ed25519 signatures;
-- separate node and administrative bearer tokens when configured;
+- per-node bearer credentials with reload-on-request rotation, plus a separate
+  administrative credential;
 - persistent node reports and heartbeat history in embedded SQLite;
 - online/stale fleet views through the CLI and HTTP API;
 - static Linux and native Windows/macOS cross-builds.
 
 Agents and the CLI can connect to HTTPS endpoints. The embedded server listener
 is HTTP-only, so terminate TLS at a reverse proxy for non-local deployments.
+Set `NIMBUS_CA_FILE` to a PEM bundle when that proxy uses a private or local CA.
 An unauthenticated server may bind only to loopback unless the explicitly unsafe
 `--allow-insecure-no-auth` option is supplied.
 
@@ -34,7 +36,7 @@ An unauthenticated server may bind only to loopback unless the explicitly unsafe
 
 - Just 1.43 or newer
 - Zig 0.16.0
-- Git, ShellCheck, and curl for the complete validation workflow
+- Git, ShellCheck, curl, Python, and OpenSSL for the complete validation workflow
 - Docker when using the container recipes
 
 All project operations are defined in `justfile`. List them with:
@@ -150,6 +152,7 @@ Every operational command accepts a JSON configuration file with `--config`:
   "cost_microunits_per_hour": 0,
   "token_file": "/run/secrets/nimbus-node-token",
   "admin_token_file": "/run/secrets/nimbus-admin-token",
+  "node_token_dir": "/run/secrets/nimbus-node-tokens",
   "bind": "127.0.0.1",
   "port": 8080,
   "database": "nimbus.db",
@@ -162,7 +165,8 @@ Precedence is command-line option, environment variable, configuration file,
 then built-in default. Supported environment variables include:
 
 - `NIMBUS_CONFIG`, `NIMBUS_SERVER`, `NIMBUS_TOKEN`, `NIMBUS_TOKEN_FILE`,
-  `NIMBUS_ADMIN_TOKEN`, and `NIMBUS_ADMIN_TOKEN_FILE`;
+  `NIMBUS_ADMIN_TOKEN`, `NIMBUS_ADMIN_TOKEN_FILE`, `NIMBUS_NODE_TOKEN_DIR`,
+  and `NIMBUS_CA_FILE`;
 - `NIMBUS_NODE_ID`, `NIMBUS_NODE_ID_FILE`, `NIMBUS_ROLE`, and `NIMBUS_LABELS`;
 - `NIMBUS_INTERVAL_SECONDS`, `NIMBUS_JITTER_SECONDS`,
   `NIMBUS_RETRY_INITIAL_SECONDS`, and `NIMBUS_RETRY_MAX_SECONDS`;
@@ -181,8 +185,12 @@ deployments so the administrative token is never copied to managed nodes.
 
 `GET /healthz` and `GET /readyz` are public. Other endpoints require `Authorization: Bearer TOKEN`
 when authentication is configured. `--token` protects agent routes;
-`--admin-token` protects operator routes and falls back to `--token` when it is
-not configured.
+`--admin-token` protects operator routes and falls back to `--token` only in
+shared-token compatibility mode. For production, pass `--node-token-dir`:
+each file is named exactly after a node ID and contains only that node's bearer
+token. Files are read for each request, so an atomic replacement rotates a node
+credential without restarting the server. When this directory is enabled, the
+shared node token cannot authorize node routes.
 
 ```text
 POST /v1/heartbeat
@@ -202,10 +210,11 @@ and returns `{ "items": [...], "next_after": "..." | null }`.
 
 Heartbeats are schema-versioned and validated before they are written. The
 server accepts legacy v1 reports, v2 reports with a required accelerator
-inventory, v3 reports with bounded feature negotiation, and v4 reports with
-bounded placement telemetry. Current agents emit v4. Upgrade the server before
-agents during a rolling deployment. CPU-only discovery is distinct from a
-failed or unavailable probe.
+inventory, v3 reports with bounded feature negotiation, v4 reports with
+bounded placement telemetry, and v5 reports that distinguish the binary target
+architecture from the runtime host architecture. Current agents emit v5.
+Upgrade the server before agents during a rolling deployment. CPU-only
+discovery is distinct from a failed or unavailable probe.
 SQLite always updates current node state, samples heartbeat history at most
 every five minutes per node, retains it for seven days, and retains audit events
 for 30 days. Enrollment is audited once instead of auditing every accepted
