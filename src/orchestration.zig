@@ -1,4 +1,5 @@
 const std = @import("std");
+const accelerator = @import("accelerator.zig");
 
 pub const schema_version: u8 = 1;
 
@@ -84,6 +85,10 @@ pub const Rollout = struct {
     auto_rollback: bool = true,
 };
 
+pub const Resources = struct {
+    accelerators: accelerator.Requirement,
+};
+
 pub const Deployment = struct {
     schema_version: u8 = schema_version,
     name: []const u8,
@@ -93,8 +98,16 @@ pub const Deployment = struct {
     artifact: ?Artifact = null,
     health_check: HealthCheck = .{},
     restart_policy: RestartPolicy = .always,
+    resources: ?Resources = null,
     targets: Targets,
     rollout: Rollout = .{},
+};
+
+pub const AcceleratorAssignment = struct {
+    deployment: []const u8,
+    revision: u64,
+    /// The outer slice and strings are borrowed from the desired-state document.
+    device_ids: []const []const u8,
 };
 
 pub const DesiredState = struct {
@@ -102,6 +115,7 @@ pub const DesiredState = struct {
     node_id: []const u8,
     generation: i64,
     deployments: []const Deployment,
+    accelerator_assignments: []const AcceleratorAssignment = &.{},
 };
 
 pub const StatusReport = struct {
@@ -121,8 +135,25 @@ pub fn validateDeployment(value: Deployment) bool {
     if (!validTargets(value.targets) or !validRollout(value.rollout)) return false;
     if (!validRuntime(value.runtime, value.artifact != null)) return false;
     if (!validHealth(value.health_check)) return false;
+    if (value.resources) |resources| {
+        if (!accelerator.validateRequirement(resources.accelerators)) return false;
+    }
     if (value.artifact) |artifact| {
         if (!validArtifact(artifact)) return false;
+    }
+    return true;
+}
+
+pub fn validateAcceleratorAssignment(value: AcceleratorAssignment) bool {
+    if (!isName(value.deployment) or value.revision == 0 or
+        value.revision > std.math.maxInt(i64) or value.device_ids.len == 0 or
+        value.device_ids.len > accelerator.max_device_count)
+        return false;
+    for (value.device_ids, 0..) |device_id, index| {
+        if (!accelerator.isValidDeviceId(device_id)) return false;
+        for (value.device_ids[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, device_id)) return false;
+        }
     }
     return true;
 }
@@ -323,4 +354,55 @@ test "deployment target label keys must be unique" {
         } },
     };
     try std.testing.expect(!validateDeployment(deployment));
+}
+
+test "deployment accelerator requirements are bounded" {
+    var deployment: Deployment = .{
+        .name = "accelerated-model",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"/bin/true"} },
+        .resources = .{ .accelerators = .{
+            .count = 2,
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .memory_min_bytes = 4 * 1024 * 1024 * 1024,
+            .capabilities = &.{ "fp16", "int8" },
+        } },
+        .targets = .{ .all = true },
+    };
+    try std.testing.expect(validateDeployment(deployment));
+
+    deployment.resources.?.accelerators.count = 0;
+    try std.testing.expect(!validateDeployment(deployment));
+    deployment.resources.?.accelerators.count = accelerator.max_device_count + 1;
+    try std.testing.expect(!validateDeployment(deployment));
+    deployment.resources.?.accelerators.count = 1;
+
+    deployment.resources.?.accelerators.memory_min_bytes = 0;
+    try std.testing.expect(!validateDeployment(deployment));
+    deployment.resources.?.accelerators.memory_min_bytes = @as(u64, std.math.maxInt(i64)) + 1;
+    try std.testing.expect(!validateDeployment(deployment));
+    deployment.resources.?.accelerators.memory_min_bytes = null;
+    deployment.resources.?.accelerators.vendor = "not a vendor";
+    try std.testing.expect(!validateDeployment(deployment));
+    deployment.resources.?.accelerators.vendor = "nvidia";
+    deployment.resources.?.accelerators.capabilities = &.{ "fp16", "fp16" };
+    try std.testing.expect(!validateDeployment(deployment));
+}
+
+test "accelerator assignment validation requires unique opaque device IDs" {
+    const valid: AcceleratorAssignment = .{
+        .deployment = "accelerated-model",
+        .revision = 7,
+        .device_ids = &.{ "gpu:nvidia:001", "gpu:nvidia:002" },
+    };
+    try std.testing.expect(validateAcceleratorAssignment(valid));
+
+    var invalid = valid;
+    invalid.device_ids = &.{ "gpu:nvidia:001", "gpu:nvidia:001" };
+    try std.testing.expect(!validateAcceleratorAssignment(invalid));
+    invalid.device_ids = &.{"raw device path /dev/nvidia0"};
+    try std.testing.expect(!validateAcceleratorAssignment(invalid));
+    invalid.device_ids = &.{};
+    try std.testing.expect(!validateAcceleratorAssignment(invalid));
 }

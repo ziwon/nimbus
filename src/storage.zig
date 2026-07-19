@@ -76,6 +76,37 @@ pub const Registry = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS node_labels_lookup
             \\  ON node_labels(label_key, label_value, node_id);
+            \\CREATE TABLE IF NOT EXISTS node_features (
+            \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+            \\  feature TEXT NOT NULL,
+            \\  PRIMARY KEY (node_id, feature)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS node_accelerator_inventory (
+            \\  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id) ON DELETE CASCADE,
+            \\  heartbeat_schema_version INTEGER NOT NULL,
+            \\  inventory_schema_version INTEGER NOT NULL,
+            \\  status TEXT NOT NULL,
+            \\  updated_unix_ms INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE IF NOT EXISTS node_accelerators (
+            \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+            \\  accelerator_id TEXT NOT NULL,
+            \\  kind TEXT NOT NULL,
+            \\  vendor TEXT NOT NULL,
+            \\  model TEXT NOT NULL,
+            \\  source TEXT NOT NULL,
+            \\  availability TEXT NOT NULL,
+            \\  memory_total_bytes INTEGER,
+            \\  PRIMARY KEY (node_id, accelerator_id)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS node_accelerator_capabilities (
+            \\  node_id TEXT NOT NULL,
+            \\  accelerator_id TEXT NOT NULL,
+            \\  capability TEXT NOT NULL,
+            \\  PRIMARY KEY (node_id, accelerator_id, capability),
+            \\  FOREIGN KEY (node_id, accelerator_id)
+            \\    REFERENCES node_accelerators(node_id, accelerator_id) ON DELETE CASCADE
+            \\);
             \\CREATE TABLE IF NOT EXISTS heartbeat_history (
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -97,7 +128,7 @@ pub const Registry = struct {
             \\  applied_unix_ms INTEGER NOT NULL
             \\);
             \\INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-            \\  VALUES (1, 0), (2, 0);
+            \\  VALUES (1, 0), (2, 0), (3, 0);
             \\CREATE TABLE IF NOT EXISTS deployments (
             \\  name TEXT PRIMARY KEY,
             \\  revision INTEGER NOT NULL,
@@ -140,6 +171,26 @@ pub const Registry = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS workload_assignments_wave
             \\  ON workload_assignments(deployment_name, wave, state);
+            \\CREATE TABLE IF NOT EXISTS accelerator_reservations (
+            \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+            \\  accelerator_id TEXT NOT NULL,
+            \\  deployment_name TEXT NOT NULL REFERENCES deployments(name) ON DELETE CASCADE,
+            \\  revision INTEGER NOT NULL,
+            \\  reserved_unix_ms INTEGER NOT NULL,
+            \\  PRIMARY KEY (node_id, accelerator_id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS accelerator_reservations_owner
+            \\  ON accelerator_reservations(deployment_name, node_id, revision);
+            \\CREATE TABLE IF NOT EXISTS placement_decisions (
+            \\  deployment_name TEXT NOT NULL REFERENCES deployments(name) ON DELETE CASCADE,
+            \\  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+            \\  revision INTEGER NOT NULL,
+            \\  status TEXT NOT NULL,
+            \\  reason_code TEXT NOT NULL,
+            \\  reason_detail TEXT NOT NULL,
+            \\  updated_unix_ms INTEGER NOT NULL,
+            \\  PRIMARY KEY (deployment_name, node_id)
+            \\);
             \\CREATE TABLE IF NOT EXISTS workload_status_history (
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\  deployment_name TEXT NOT NULL,
@@ -230,6 +281,8 @@ pub const Registry = struct {
             try insert_label.done();
         }
 
+        try self.replaceNodeAcceleratorInventory(report, received_unix_ms);
+
         if (sample_history) {
             var history = try self.prepare(
                 "INSERT INTO heartbeat_history " ++
@@ -251,6 +304,93 @@ pub const Registry = struct {
         }
         if (enrolled) try self.audit(received_unix_ms, report.node_id, "node.enrolled", report.agent_version);
         try self.exec("COMMIT;");
+    }
+
+    fn replaceNodeAcceleratorInventory(
+        self: *Registry,
+        report: heartbeat.Heartbeat,
+        received_unix_ms: i64,
+    ) !void {
+        var clear_features = try self.prepare("DELETE FROM node_features WHERE node_id=?;");
+        defer clear_features.finalize();
+        try clear_features.bindText(1, report.node_id);
+        try clear_features.done();
+        for (report.features) |feature| {
+            var insert_feature = try self.prepare(
+                "INSERT INTO node_features (node_id, feature) VALUES (?, ?);",
+            );
+            defer insert_feature.finalize();
+            try insert_feature.bindText(1, report.node_id);
+            try insert_feature.bindText(2, feature);
+            try insert_feature.done();
+        }
+
+        const inventory_status = if (report.accelerator_inventory) |inventory|
+            @tagName(inventory.status)
+        else
+            "unreported";
+        const inventory_schema: i64 = if (report.accelerator_inventory) |inventory|
+            inventory.schema_version
+        else
+            0;
+        var upsert_inventory = try self.prepare(
+            \\INSERT INTO node_accelerator_inventory (
+            \\  node_id, heartbeat_schema_version, inventory_schema_version, status, updated_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?)
+            \\ON CONFLICT(node_id) DO UPDATE SET
+            \\  heartbeat_schema_version=excluded.heartbeat_schema_version,
+            \\  inventory_schema_version=excluded.inventory_schema_version,
+            \\  status=excluded.status,
+            \\  updated_unix_ms=excluded.updated_unix_ms;
+        );
+        defer upsert_inventory.finalize();
+        try upsert_inventory.bindText(1, report.node_id);
+        try upsert_inventory.bindInt64(2, report.schema_version);
+        try upsert_inventory.bindInt64(3, inventory_schema);
+        try upsert_inventory.bindText(4, inventory_status);
+        try upsert_inventory.bindInt64(5, received_unix_ms);
+        try upsert_inventory.done();
+
+        var clear_accelerators = try self.prepare("DELETE FROM node_accelerators WHERE node_id=?;");
+        defer clear_accelerators.finalize();
+        try clear_accelerators.bindText(1, report.node_id);
+        try clear_accelerators.done();
+
+        const inventory = report.accelerator_inventory orelse return;
+        for (inventory.accelerators) |device| {
+            var insert_device = try self.prepare(
+                \\INSERT INTO node_accelerators (
+                \\  node_id, accelerator_id, kind, vendor, model, source,
+                \\  availability, memory_total_bytes
+                \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            );
+            defer insert_device.finalize();
+            try insert_device.bindText(1, report.node_id);
+            try insert_device.bindText(2, device.id);
+            try insert_device.bindText(3, @tagName(device.kind));
+            try insert_device.bindText(4, device.vendor);
+            try insert_device.bindText(5, device.model);
+            try insert_device.bindText(6, device.source);
+            try insert_device.bindText(7, @tagName(device.availability));
+            if (device.memory_total_bytes) |memory|
+                try insert_device.bindInt64(8, @intCast(memory))
+            else
+                try insert_device.bindNull(8);
+            try insert_device.done();
+
+            for (device.capabilities) |capability| {
+                var insert_capability = try self.prepare(
+                    \\INSERT INTO node_accelerator_capabilities (
+                    \\  node_id, accelerator_id, capability
+                    \\) VALUES (?, ?, ?);
+                );
+                defer insert_capability.finalize();
+                try insert_capability.bindText(1, report.node_id);
+                try insert_capability.bindText(2, device.id);
+                try insert_capability.bindText(3, capability);
+                try insert_capability.done();
+            }
+        }
     }
 
     pub fn listNodes(
@@ -445,6 +585,28 @@ pub const Registry = struct {
             deployment.rollout.batch_size,
             now_unix_ms,
         );
+        var release_untargeted = try self.prepare(
+            \\DELETE FROM accelerator_reservations
+            \\WHERE deployment_name=? AND NOT EXISTS (
+            \\  SELECT 1 FROM workload_assignments a
+            \\  WHERE a.deployment_name=accelerator_reservations.deployment_name
+            \\    AND a.node_id=accelerator_reservations.node_id
+            \\);
+        );
+        defer release_untargeted.finalize();
+        try release_untargeted.bindText(1, deployment.name);
+        try release_untargeted.done();
+        var clear_untargeted_decisions = try self.prepare(
+            \\DELETE FROM placement_decisions
+            \\WHERE deployment_name=? AND NOT EXISTS (
+            \\  SELECT 1 FROM workload_assignments a
+            \\  WHERE a.deployment_name=placement_decisions.deployment_name
+            \\    AND a.node_id=placement_decisions.node_id
+            \\);
+        );
+        defer clear_untargeted_decisions.finalize();
+        try clear_untargeted_decisions.bindText(1, deployment.name);
+        try clear_untargeted_decisions.done();
 
         try self.audit(now_unix_ms, "", "deployment.applied", deployment.name);
         try self.exec("COMMIT;");
@@ -539,6 +701,50 @@ pub const Registry = struct {
             first = false;
             try output.appendSlice(self.allocator, item);
         }
+        try output.appendSlice(self.allocator, "],\"placements\":[");
+        var placements = try self.prepare(
+            \\SELECT node_id, revision, status, reason_code, reason_detail, updated_unix_ms
+            \\FROM placement_decisions WHERE deployment_name=? ORDER BY node_id;
+        );
+        defer placements.finalize();
+        try placements.bindText(1, name);
+        first = true;
+        while (try placements.row()) {
+            const summary: PlacementSummary = .{
+                .node_id = placements.columnText(0),
+                .revision = @intCast(placements.columnInt64(1)),
+                .status = placements.columnText(2),
+                .reason_code = placements.columnText(3),
+                .reason_detail = placements.columnText(4),
+                .updated_unix_ms = placements.columnInt64(5),
+            };
+            const item = try std.json.Stringify.valueAlloc(self.allocator, summary, .{});
+            defer self.allocator.free(item);
+            if (!first) try output.append(self.allocator, ',');
+            first = false;
+            try output.appendSlice(self.allocator, item);
+        }
+
+        try output.appendSlice(self.allocator, "],\"accelerator_reservations\":[");
+        var reservations = try self.prepare(
+            \\SELECT node_id, accelerator_id, revision FROM accelerator_reservations
+            \\WHERE deployment_name=? ORDER BY node_id, accelerator_id;
+        );
+        defer reservations.finalize();
+        try reservations.bindText(1, name);
+        first = true;
+        while (try reservations.row()) {
+            const summary: ReservationSummary = .{
+                .node_id = reservations.columnText(0),
+                .accelerator_id = reservations.columnText(1),
+                .revision = @intCast(reservations.columnInt64(2)),
+            };
+            const item = try std.json.Stringify.valueAlloc(self.allocator, summary, .{});
+            defer self.allocator.free(item);
+            if (!first) try output.append(self.allocator, ',');
+            first = false;
+            try output.appendSlice(self.allocator, item);
+        }
         try output.appendSlice(self.allocator, "]}\n");
         return try output.toOwnedSlice(self.allocator);
     }
@@ -574,13 +780,27 @@ pub const Registry = struct {
         defer self.mutex.unlock(self.io);
         var role_value: ?[]u8 = null;
         defer if (role_value) |value| self.allocator.free(value);
+        var report_json: ?[]u8 = null;
+        defer if (report_json) |value| self.allocator.free(value);
         {
-            var node = try self.prepare("SELECT role FROM nodes WHERE node_id=?;");
+            var node = try self.prepare("SELECT role, report_json FROM nodes WHERE node_id=?;");
             defer node.finalize();
             try node.bindText(1, node_id);
             if (!try node.row()) return null;
             role_value = try self.allocator.dupe(u8, node.columnText(0));
+            report_json = try self.allocator.dupe(u8, node.columnText(1));
         }
+        var node_report = try std.json.parseFromSlice(
+            heartbeat.Heartbeat,
+            self.allocator,
+            report_json.?,
+            .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+        );
+        defer node_report.deinit();
+        const supports_accelerator_requirements = hasFeature(
+            node_report.value.features,
+            heartbeat.feature_accelerator_requirements_v1,
+        );
 
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -628,7 +848,12 @@ pub const Registry = struct {
         defer self.allocator.free(prefix);
         try output.appendSlice(self.allocator, prefix);
 
+        var assignment_output: std.ArrayList(u8) = .empty;
+        defer assignment_output.deinit(self.allocator);
+        try assignment_output.append(self.allocator, '[');
+
         var first = true;
+        var first_assignment = true;
         while (try deployments.row()) {
             const name = try self.allocator.dupe(u8, deployments.columnText(0));
             defer self.allocator.free(name);
@@ -652,14 +877,295 @@ pub const Registry = struct {
                 rollout_status,
                 now_unix_ms,
             );
-            const selected = if (wave <= current_wave) current_spec else previous_spec orelse continue;
+            const selected_spec = if (wave <= current_wave) current_spec else previous_spec orelse continue;
+            var emitted_spec = selected_spec;
+            var parsed_spec = try std.json.parseFromSlice(
+                orchestration.Deployment,
+                self.allocator,
+                selected_spec,
+                .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+            );
+            defer parsed_spec.deinit();
+
+            if (parsed_spec.value.resources) |resources| {
+                if (parsed_spec.value.desired == .stopped) {
+                    try self.releasePlacement(parsed_spec.value.name, node_id);
+                } else {
+                    if (!supports_accelerator_requirements) {
+                        try self.recordPlacementDecision(
+                            parsed_spec.value,
+                            node_id,
+                            false,
+                            "agent_feature_unsupported",
+                            now_unix_ms,
+                        );
+                        const fallback = previous_spec orelse continue;
+                        if (!try isCpuDeploymentSpec(self.allocator, fallback)) continue;
+                        emitted_spec = fallback;
+                    } else {
+                        var placement = try self.placeAccelerators(
+                            node_report.value,
+                            parsed_spec.value,
+                            resources.accelerators,
+                            now_unix_ms,
+                        );
+                        defer placement.deinit();
+                        try self.recordPlacementDecision(
+                            parsed_spec.value,
+                            node_id,
+                            placement.ready,
+                            placement.reason_code,
+                            now_unix_ms,
+                        );
+                        if (placement.ready) {
+                            const assignment: orchestration.AcceleratorAssignment = .{
+                                .deployment = parsed_spec.value.name,
+                                .revision = parsed_spec.value.revision,
+                                .device_ids = placement.ids.items,
+                            };
+                            const assignment_json = try std.json.Stringify.valueAlloc(
+                                self.allocator,
+                                assignment,
+                                .{},
+                            );
+                            defer self.allocator.free(assignment_json);
+                            if (!first_assignment) try assignment_output.append(self.allocator, ',');
+                            first_assignment = false;
+                            try assignment_output.appendSlice(self.allocator, assignment_json);
+                        }
+                    }
+                }
+            } else {
+                try self.releasePlacement(parsed_spec.value.name, node_id);
+            }
             if (!first) try output.append(self.allocator, ',');
             first = false;
-            try output.appendSlice(self.allocator, selected);
+            try output.appendSlice(self.allocator, emitted_spec);
         }
-        try output.appendSlice(self.allocator, "]}\n");
+        try output.append(self.allocator, ']');
+        if (supports_accelerator_requirements) {
+            try assignment_output.append(self.allocator, ']');
+            try output.appendSlice(self.allocator, ",\"accelerator_assignments\":");
+            try output.appendSlice(self.allocator, assignment_output.items);
+        }
+        try output.appendSlice(self.allocator, "}\n");
         try self.exec("COMMIT;");
         return try output.toOwnedSlice(self.allocator);
+    }
+
+    fn placeAccelerators(
+        self: *Registry,
+        report: heartbeat.Heartbeat,
+        deployment: orchestration.Deployment,
+        requirement: accelerator.Requirement,
+        now_unix_ms: i64,
+    ) !PlacementResult {
+        var existing = try self.loadExistingReservation(report.node_id, deployment.name);
+        defer existing.ids.deinit();
+        const inventory = report.accelerator_inventory orelse
+            return self.blockedPlacement(if (existing.ids.items.len == 0)
+                "inventory_missing"
+            else
+                "assigned_device_unconfirmed");
+
+        if (existing.ids.items.len > 0) {
+            if (inventory.status != .unavailable and
+                reservationMatches(inventory, requirement, existing.ids.items))
+            {
+                var update = try self.prepare(
+                    \\UPDATE accelerator_reservations SET revision=?, reserved_unix_ms=?
+                    \\WHERE node_id=? AND deployment_name=?;
+                );
+                defer update.finalize();
+                try update.bindInt64(1, @intCast(deployment.revision));
+                try update.bindInt64(2, now_unix_ms);
+                try update.bindText(3, report.node_id);
+                try update.bindText(4, deployment.name);
+                try update.done();
+                return .{
+                    .ids = try cloneIds(self.allocator, existing.ids.items),
+                    .ready = true,
+                    .reason_code = "",
+                };
+            }
+            if (inventory.status != .complete)
+                return self.blockedPlacement("assigned_device_unconfirmed");
+            if (existing.revision == deployment.revision) {
+                const reason = if (reservationIdsPresent(inventory, existing.ids.items))
+                    "assigned_device_incompatible"
+                else
+                    "assigned_device_missing";
+                return self.blockedPlacement(reason);
+            }
+            var release_old = try self.prepare(
+                "DELETE FROM accelerator_reservations WHERE node_id=? AND deployment_name=?;",
+            );
+            defer release_old.finalize();
+            try release_old.bindText(1, report.node_id);
+            try release_old.bindText(2, deployment.name);
+            try release_old.done();
+        }
+
+        if (inventory.status == .complete and inventory.accelerators.len == 0)
+            return self.blockedPlacement("no_accelerator");
+
+        var reserved = try self.loadOtherReservationIds(report.node_id, deployment.name);
+        defer reserved.deinit();
+        const selected = accelerator.selectAlloc(
+            self.allocator,
+            inventory,
+            requirement,
+            reserved.items,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.blockedPlacement(selectionReason(err)),
+        };
+        defer self.allocator.free(selected);
+
+        for (selected) |device_id| {
+            var insert = try self.prepare(
+                \\INSERT INTO accelerator_reservations (
+                \\  node_id, accelerator_id, deployment_name, revision, reserved_unix_ms
+                \\) VALUES (?, ?, ?, ?, ?);
+            );
+            defer insert.finalize();
+            try insert.bindText(1, report.node_id);
+            try insert.bindText(2, device_id);
+            try insert.bindText(3, deployment.name);
+            try insert.bindInt64(4, @intCast(deployment.revision));
+            try insert.bindInt64(5, now_unix_ms);
+            try insert.done();
+        }
+        return .{
+            .ids = try cloneIds(self.allocator, selected),
+            .ready = true,
+            .reason_code = "",
+        };
+    }
+
+    fn blockedPlacement(self: *Registry, reason_code: []const u8) !PlacementResult {
+        return .{
+            .ids = .{
+                .allocator = self.allocator,
+                .items = try self.allocator.alloc([]const u8, 0),
+            },
+            .ready = false,
+            .reason_code = reason_code,
+        };
+    }
+
+    fn loadExistingReservation(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !ExistingReservation {
+        var statement = try self.prepare(
+            \\SELECT accelerator_id, revision FROM accelerator_reservations
+            \\WHERE node_id=? AND deployment_name=? ORDER BY accelerator_id;
+        );
+        defer statement.finalize();
+        try statement.bindText(1, node_id);
+        try statement.bindText(2, deployment_name);
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        var revision: ?u64 = null;
+        while (try statement.row()) {
+            try ids.append(self.allocator, try self.allocator.dupe(u8, statement.columnText(0)));
+            const row_revision: u64 = @intCast(statement.columnInt64(1));
+            if (revision) |value| {
+                if (value != row_revision) return error.InconsistentReservation;
+            } else revision = row_revision;
+        }
+        return .{
+            .ids = .{ .allocator = self.allocator, .items = try ids.toOwnedSlice(self.allocator) },
+            .revision = revision,
+        };
+    }
+
+    fn loadOtherReservationIds(
+        self: *Registry,
+        node_id: []const u8,
+        deployment_name: []const u8,
+    ) !OwnedIds {
+        var statement = try self.prepare(
+            \\SELECT accelerator_id FROM accelerator_reservations
+            \\WHERE node_id=? AND deployment_name<>? ORDER BY accelerator_id;
+        );
+        defer statement.finalize();
+        try statement.bindText(1, node_id);
+        try statement.bindText(2, deployment_name);
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        while (try statement.row())
+            try ids.append(self.allocator, try self.allocator.dupe(u8, statement.columnText(0)));
+        return .{ .allocator = self.allocator, .items = try ids.toOwnedSlice(self.allocator) };
+    }
+
+    fn recordPlacementDecision(
+        self: *Registry,
+        deployment: orchestration.Deployment,
+        node_id: []const u8,
+        is_ready: bool,
+        reason_code: []const u8,
+        now_unix_ms: i64,
+    ) !void {
+        var upsert = try self.prepare(
+            \\INSERT INTO placement_decisions (
+            \\  deployment_name, node_id, revision, status, reason_code,
+            \\  reason_detail, updated_unix_ms
+            \\) VALUES (?, ?, ?, ?, ?, '', ?)
+            \\ON CONFLICT(deployment_name, node_id) DO UPDATE SET
+            \\  revision=excluded.revision, status=excluded.status,
+            \\  reason_code=excluded.reason_code, reason_detail='',
+            \\  updated_unix_ms=excluded.updated_unix_ms;
+        );
+        defer upsert.finalize();
+        try upsert.bindText(1, deployment.name);
+        try upsert.bindText(2, node_id);
+        try upsert.bindInt64(3, @intCast(deployment.revision));
+        try upsert.bindText(4, if (is_ready) "ready" else "unschedulable");
+        try upsert.bindText(5, reason_code);
+        try upsert.bindInt64(6, now_unix_ms);
+        try upsert.done();
+
+        const assignment_state = if (is_ready) "pending" else "blocked";
+        const assignment_message = if (is_ready) "" else reason_code;
+        var update_assignment = try self.prepare(
+            \\UPDATE workload_assignments SET state=?, message=?, updated_unix_ms=?
+            \\WHERE deployment_name=? AND node_id=?
+            \\  AND (state='pending' OR (?=0 AND state='blocked'));
+        );
+        defer update_assignment.finalize();
+        try update_assignment.bindText(1, assignment_state);
+        try update_assignment.bindText(2, assignment_message);
+        try update_assignment.bindInt64(3, now_unix_ms);
+        try update_assignment.bindText(4, deployment.name);
+        try update_assignment.bindText(5, node_id);
+        try update_assignment.bindInt64(6, @intFromBool(is_ready));
+        try update_assignment.done();
+    }
+
+    fn releasePlacement(self: *Registry, deployment_name: []const u8, node_id: []const u8) !void {
+        var release = try self.prepare(
+            "DELETE FROM accelerator_reservations WHERE deployment_name=? AND node_id=?;",
+        );
+        defer release.finalize();
+        try release.bindText(1, deployment_name);
+        try release.bindText(2, node_id);
+        try release.done();
+        var clear_decision = try self.prepare(
+            "DELETE FROM placement_decisions WHERE deployment_name=? AND node_id=?;",
+        );
+        defer clear_decision.finalize();
+        try clear_decision.bindText(1, deployment_name);
+        try clear_decision.bindText(2, node_id);
+        try clear_decision.done();
     }
 
     pub fn recordWorkloadStatus(
@@ -1043,6 +1549,48 @@ const AssignmentSummary = struct {
     updated_unix_ms: i64,
 };
 
+const PlacementSummary = struct {
+    node_id: []const u8,
+    revision: u64,
+    status: []const u8,
+    reason_code: []const u8,
+    reason_detail: []const u8,
+    updated_unix_ms: i64,
+};
+
+const ReservationSummary = struct {
+    node_id: []const u8,
+    accelerator_id: []const u8,
+    revision: u64,
+};
+
+const OwnedIds = struct {
+    allocator: std.mem.Allocator,
+    items: []const []const u8,
+
+    fn deinit(self: *OwnedIds) void {
+        for (self.items) |item| self.allocator.free(item);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const ExistingReservation = struct {
+    ids: OwnedIds,
+    revision: ?u64,
+};
+
+const PlacementResult = struct {
+    ids: OwnedIds,
+    ready: bool,
+    reason_code: []const u8,
+
+    fn deinit(self: *PlacementResult) void {
+        self.ids.deinit();
+        self.* = undefined;
+    }
+};
+
 const Statement = struct {
     handle: *c.sqlite3_stmt,
     db: *c.sqlite3,
@@ -1062,6 +1610,13 @@ const Statement = struct {
     fn bindInt64(self: *Statement, index: c_int, value: i64) !void {
         if (c.sqlite3_bind_int64(self.handle, index, value) != c.SQLITE_OK) {
             logSqliteError(self.db, "bind integer");
+            return error.SqliteBindFailed;
+        }
+    }
+
+    fn bindNull(self: *Statement, index: c_int) !void {
+        if (c.sqlite3_bind_null(self.handle, index) != c.SQLITE_OK) {
+            logSqliteError(self.db, "bind null");
             return error.SqliteBindFailed;
         }
     }
@@ -1099,6 +1654,89 @@ const Statement = struct {
         return c.sqlite3_column_type(self.handle, index) == c.SQLITE_NULL;
     }
 };
+
+fn hasFeature(features: []const []const u8, expected: []const u8) bool {
+    for (features) |feature| {
+        if (std.mem.eql(u8, feature, expected)) return true;
+    }
+    return false;
+}
+
+fn isCpuDeploymentSpec(allocator: std.mem.Allocator, spec_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(
+        orchestration.Deployment,
+        allocator,
+        spec_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    return parsed.value.resources == null;
+}
+
+fn cloneIds(allocator: std.mem.Allocator, input: []const []const u8) !OwnedIds {
+    const items = try allocator.alloc([]const u8, input.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |item| allocator.free(item);
+        allocator.free(items);
+    }
+    for (input) |item| {
+        items[initialized] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return .{ .allocator = allocator, .items = items };
+}
+
+fn reservationMatches(
+    inventory: accelerator.InventoryReport,
+    requirement: accelerator.Requirement,
+    device_ids: []const []const u8,
+) bool {
+    if (device_ids.len != requirement.count) return false;
+    for (device_ids) |device_id| {
+        var matched = false;
+        for (inventory.accelerators) |device| {
+            if (!std.mem.eql(u8, device.id, device_id)) continue;
+            matched = accelerator.matchesRequirement(device, requirement);
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
+fn reservationIdsPresent(
+    inventory: accelerator.InventoryReport,
+    device_ids: []const []const u8,
+) bool {
+    for (device_ids) |device_id| {
+        var found = false;
+        for (inventory.accelerators) |device| {
+            if (!std.mem.eql(u8, device.id, device_id)) continue;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn selectionReason(err: accelerator.SelectionError) []const u8 {
+    return switch (err) {
+        error.InvalidInventory => "invalid_inventory",
+        error.InvalidRequirement => "invalid_requirement",
+        error.InventoryPartial => "inventory_partial",
+        error.InventoryUnavailable => "inventory_unavailable",
+        error.KindMismatch => "accelerator_kind_unavailable",
+        error.DeviceUnavailable => "accelerator_unavailable",
+        error.VendorMismatch => "accelerator_vendor_unavailable",
+        error.MemoryMismatch => "accelerator_memory_insufficient",
+        error.CapabilityMismatch => "accelerator_capability_missing",
+        error.InsufficientDevices => "accelerator_count_insufficient",
+        error.DeviceReserved => "accelerator_capacity_exhausted",
+        error.OutOfMemory => "out_of_memory",
+    };
+}
 
 fn logSqliteError(db: *c.sqlite3, operation: []const u8) void {
     const message = std.mem.span(c.sqlite3_errmsg(db));
@@ -1162,6 +1800,7 @@ test "version one and accelerator inventory heartbeats coexist" {
         .devices_found = 1,
     }};
     const version_two: heartbeat.Heartbeat = .{
+        .schema_version = 2,
         .node_id = "accelerated-edge",
         .hostname = "accelerated-edge",
         .role = "edge",
@@ -1188,6 +1827,188 @@ test "version one and accelerator inventory heartbeats coexist" {
     try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"schema_version\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"gpu:nvidia:7f3c\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, accelerated, "\"status\":\"complete\"") != null);
+}
+
+test "accelerator placement is deterministic and exclusive" {
+    var registry = try Registry.open(std.testing.allocator, std.testing.io, ":memory:");
+    defer registry.close();
+    const devices = [_]accelerator.Device{.{
+        .id = "gpu:nvidia:a",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "L4",
+        .source = "fixture",
+        .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+        .capabilities = &.{"fp16"},
+    }};
+    const probes = [_]accelerator.ProbeOutcome{.{
+        .name = "fixture",
+        .status = .ok,
+        .devices_found = 1,
+    }};
+    const report: heartbeat.Heartbeat = .{
+        .node_id = "gpu-edge",
+        .hostname = "gpu-edge",
+        .role = "edge",
+        .features = &.{heartbeat.feature_accelerator_requirements_v1},
+        .platform = .{ .os = "linux", .arch = "x86_64", .abi = "gnu" },
+        .resources = .{ .cpu_count = 8 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &devices,
+            .probes = &probes,
+        },
+        .timestamp_unix_ms = 1000,
+    };
+    const heartbeat_json = try heartbeat.serializeAlloc(std.testing.allocator, report);
+    defer std.testing.allocator.free(heartbeat_json);
+    try registry.recordHeartbeat(report, heartbeat_json, 1000);
+
+    const first: orchestration.Deployment = .{
+        .name = "accelerated-a",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"/bin/true"} },
+        .resources = .{ .accelerators = .{
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .memory_min_bytes = 8 * 1024 * 1024 * 1024,
+            .capabilities = &.{"fp16"},
+        } },
+        .targets = .{ .all = true },
+    };
+    const first_json = try std.json.Stringify.valueAlloc(std.testing.allocator, first, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(first_json);
+    try registry.applyDeployment(first, first_json, 1100);
+
+    var second = first;
+    second.name = "accelerated-b";
+    const second_json = try std.json.Stringify.valueAlloc(std.testing.allocator, second, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(second_json);
+    try registry.applyDeployment(second, second_json, 1200);
+
+    const desired_json = (try registry.desiredStateForNode("gpu-edge", 1300)).?;
+    defer std.testing.allocator.free(desired_json);
+    var desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        desired_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer desired.deinit();
+    try std.testing.expectEqual(@as(usize, 2), desired.value.deployments.len);
+    try std.testing.expectEqualStrings("accelerated-a", desired.value.deployments[0].name);
+    try std.testing.expectEqualStrings("accelerated-b", desired.value.deployments[1].name);
+    try std.testing.expectEqual(@as(usize, 1), desired.value.accelerator_assignments.len);
+    try std.testing.expectEqualStrings(
+        "gpu:nvidia:a",
+        desired.value.accelerator_assignments[0].device_ids[0],
+    );
+
+    const first_inspect = (try registry.inspectDeployment("accelerated-a")).?;
+    defer std.testing.allocator.free(first_inspect);
+    try std.testing.expect(std.mem.indexOf(u8, first_inspect, "\"accelerator_id\":\"gpu:nvidia:a\"") != null);
+    const second_inspect = (try registry.inspectDeployment("accelerated-b")).?;
+    defer std.testing.allocator.free(second_inspect);
+    try std.testing.expect(std.mem.indexOf(u8, second_inspect, "\"reason_code\":\"accelerator_capacity_exhausted\"") != null);
+
+    var normalized = try registry.prepare("SELECT COUNT(*) FROM node_accelerators;");
+    defer normalized.finalize();
+    try std.testing.expect(try normalized.row());
+    try std.testing.expectEqual(@as(i64, 1), normalized.columnInt64(0));
+
+    const failed_probes = [_]accelerator.ProbeOutcome{.{
+        .name = "fixture",
+        .status = .failed,
+        .devices_found = 0,
+        .error_name = "ProviderCommandFailed",
+    }};
+    var unavailable_report = report;
+    unavailable_report.accelerator_inventory = .{
+        .status = .unavailable,
+        .accelerators = &.{},
+        .probes = &failed_probes,
+    };
+    const unavailable_json = try heartbeat.serializeAlloc(std.testing.allocator, unavailable_report);
+    defer std.testing.allocator.free(unavailable_json);
+    try registry.recordHeartbeat(unavailable_report, unavailable_json, 1400);
+    const unavailable_desired = (try registry.desiredStateForNode("gpu-edge", 1500)).?;
+    defer std.testing.allocator.free(unavailable_desired);
+    const unconfirmed = (try registry.inspectDeployment("accelerated-a")).?;
+    defer std.testing.allocator.free(unconfirmed);
+    try std.testing.expect(std.mem.indexOf(u8, unconfirmed, "\"reason_code\":\"assigned_device_unconfirmed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unconfirmed, "\"accelerator_id\":\"gpu:nvidia:a\"") != null);
+
+    const empty_probes = [_]accelerator.ProbeOutcome{.{
+        .name = "fixture",
+        .status = .ok,
+        .devices_found = 0,
+    }};
+    var empty_report = report;
+    empty_report.accelerator_inventory = .{
+        .status = .complete,
+        .accelerators = &.{},
+        .probes = &empty_probes,
+    };
+    const empty_json = try heartbeat.serializeAlloc(std.testing.allocator, empty_report);
+    defer std.testing.allocator.free(empty_json);
+    try registry.recordHeartbeat(empty_report, empty_json, 1600);
+    const empty_desired = (try registry.desiredStateForNode("gpu-edge", 1700)).?;
+    defer std.testing.allocator.free(empty_desired);
+    const missing = (try registry.inspectDeployment("accelerated-a")).?;
+    defer std.testing.allocator.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"reason_code\":\"assigned_device_missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"accelerator_id\":\"gpu:nvidia:a\"") != null);
+
+    const cpu_v1: orchestration.Deployment = .{
+        .name = "compat-workload",
+        .revision = 1,
+        .runtime = .{ .kind = .process, .command = &.{"/bin/true"} },
+        .targets = .{ .node_ids = &.{"gpu-edge"} },
+    };
+    const cpu_v1_json = try std.json.Stringify.valueAlloc(std.testing.allocator, cpu_v1, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(cpu_v1_json);
+    try registry.applyDeployment(cpu_v1, cpu_v1_json, 1800);
+
+    var legacy_report = report;
+    legacy_report.schema_version = 2;
+    legacy_report.features = &.{};
+    const legacy_json = try heartbeat.serializeAlloc(std.testing.allocator, legacy_report);
+    defer std.testing.allocator.free(legacy_json);
+    try registry.recordHeartbeat(legacy_report, legacy_json, 1900);
+
+    var accelerated_v2 = cpu_v1;
+    accelerated_v2.revision = 2;
+    accelerated_v2.resources = first.resources;
+    const accelerated_v2_json = try std.json.Stringify.valueAlloc(
+        std.testing.allocator,
+        accelerated_v2,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer std.testing.allocator.free(accelerated_v2_json);
+    try registry.applyDeployment(accelerated_v2, accelerated_v2_json, 2000);
+
+    const legacy_desired_json = (try registry.desiredStateForNode("gpu-edge", 2100)).?;
+    defer std.testing.allocator.free(legacy_desired_json);
+    var legacy_desired = try std.json.parseFromSlice(
+        orchestration.DesiredState,
+        std.testing.allocator,
+        legacy_desired_json,
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
+    );
+    defer legacy_desired.deinit();
+    try std.testing.expectEqual(@as(usize, 1), legacy_desired.value.deployments.len);
+    try std.testing.expectEqualStrings(
+        "compat-workload",
+        legacy_desired.value.deployments[0].name,
+    );
+    try std.testing.expectEqual(@as(u64, 1), legacy_desired.value.deployments[0].revision);
+    try std.testing.expect(legacy_desired.value.deployments[0].resources == null);
 }
 
 test "heartbeat history is sampled and enrollment audit is not duplicated" {

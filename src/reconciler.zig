@@ -1,12 +1,15 @@
 const std = @import("std");
+const accelerator = @import("accelerator.zig");
 const client = @import("client.zig");
 const orchestration = @import("orchestration.zig");
+const reservation = @import("reservation.zig");
 const runtime = @import("runtime.zig");
 const shutdown = @import("shutdown.zig");
 
 const LocalState = struct {
-    schema_version: u8 = 1,
+    schema_version: u8 = 2,
     applied: []const runtime.AppliedRecord = &.{},
+    accelerator_reservations: reservation.Ledger = .{},
 };
 
 pub const Options = struct {
@@ -14,6 +17,7 @@ pub const Options = struct {
     node_id: []const u8,
     token: ?[]const u8,
     runtime_options: runtime.Options,
+    accelerator_inventory: accelerator.InventoryReport,
 };
 
 pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
@@ -36,6 +40,13 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
     for (desired.value.deployments) |deployment| {
         if (!orchestration.validateDeployment(deployment)) return error.InvalidDesiredState;
     }
+    var desired_reservations = try reservation.fromAssignments(
+        init.gpa,
+        desired.value.accelerator_assignments,
+    );
+    defer desired_reservations.deinit();
+    if (!validDesiredReservations(desired.value, options.accelerator_inventory))
+        return error.InvalidDesiredState;
 
     const state_path = try std.fmt.allocPrint(
         init.gpa,
@@ -57,7 +68,9 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         null;
     defer if (parsed_state) |*parsed| parsed.deinit();
     const previous: LocalState = if (parsed_state) |parsed| parsed.value else .{};
-    if (previous.schema_version != 1) return error.UnsupportedLocalState;
+    if (previous.schema_version != 1 and previous.schema_version != 2)
+        return error.UnsupportedLocalState;
+    try reservation.validate(previous.accelerator_reservations);
 
     var next: std.ArrayList(runtime.AppliedRecord) = .empty;
     defer next.deinit(init.gpa);
@@ -78,6 +91,27 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
                 continue;
             };
             report(init, options, deployment, .stopped, "desired state is stopped") catch {
+                status_delivery_failed = true;
+            };
+            continue;
+        }
+
+        if (deployment.resources != null) {
+            if (old) |record| try next.append(init.gpa, record);
+            const block_reason = if (findAssignment(
+                desired.value.accelerator_assignments,
+                deployment.name,
+            ) == null)
+                "accelerator_assignment_unavailable"
+            else
+                "runtime_device_injection_unavailable";
+            report(
+                init,
+                options,
+                deployment,
+                .blocked,
+                block_reason,
+            ) catch {
                 status_delivery_failed = true;
             };
             continue;
@@ -145,7 +179,10 @@ pub fn reconcileOnce(init: std.process.Init, options: Options) !void {
         };
     }
 
-    try saveState(init, state_path, .{ .applied = next.items });
+    try saveState(init, state_path, .{
+        .applied = next.items,
+        .accelerator_reservations = desired_reservations.view(),
+    });
     if (status_delivery_failed) return error.StatusDeliveryFailed;
 }
 
@@ -264,6 +301,61 @@ fn desiredContains(deployments: []const orchestration.Deployment, name: []const 
     return false;
 }
 
+fn validDesiredReservations(
+    desired: orchestration.DesiredState,
+    inventory: accelerator.InventoryReport,
+) bool {
+    for (desired.deployments) |deployment| {
+        const assignment = findAssignment(
+            desired.accelerator_assignments,
+            deployment.name,
+        );
+        const resources = deployment.resources orelse {
+            if (assignment != null) return false;
+            continue;
+        };
+        if (deployment.desired == .stopped) {
+            if (assignment != null) return false;
+            continue;
+        }
+        const selected = assignment orelse continue;
+        if (!orchestration.validateAcceleratorAssignment(selected) or
+            selected.revision != deployment.revision or
+            selected.device_ids.len != resources.accelerators.count or
+            inventory.status == .unavailable)
+            return false;
+        for (selected.device_ids) |device_id| {
+            var matched = false;
+            for (inventory.accelerators) |device| {
+                if (!std.mem.eql(u8, device.id, device_id)) continue;
+                matched = accelerator.matchesRequirement(device, resources.accelerators);
+                break;
+            }
+            if (!matched) return false;
+        }
+    }
+    for (desired.accelerator_assignments) |assignment| {
+        var found = false;
+        for (desired.deployments) |deployment| {
+            if (!std.mem.eql(u8, deployment.name, assignment.deployment)) continue;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn findAssignment(
+    assignments: []const orchestration.AcceleratorAssignment,
+    deployment_name: []const u8,
+) ?orchestration.AcceleratorAssignment {
+    for (assignments) |assignment| {
+        if (std.mem.eql(u8, assignment.deployment, deployment_name)) return assignment;
+    }
+    return null;
+}
+
 fn readStateAlloc(init: std.process.Init, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
     defer file.close(init.io);
@@ -301,4 +393,59 @@ test "orchestration endpoints are derived from the server URL" {
         "http://127.0.0.1:8080/v1/nodes/edge-01/desired-state",
         value,
     );
+}
+
+test "desired accelerator assignments are verified against the heartbeat snapshot" {
+    const devices = [_]accelerator.Device{.{
+        .id = "gpu:nvidia:a",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "L4",
+        .source = "fixture",
+        .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+        .capabilities = &.{"fp16"},
+    }};
+    const inventory: accelerator.InventoryReport = .{
+        .status = .complete,
+        .accelerators = &devices,
+        .probes = &.{},
+    };
+    const deployments = [_]orchestration.Deployment{.{
+        .name = "vision",
+        .revision = 2,
+        .runtime = .{ .kind = .process, .command = &.{"/bin/true"} },
+        .resources = .{ .accelerators = .{
+            .kind = .gpu,
+            .vendor = "nvidia",
+            .capabilities = &.{"fp16"},
+        } },
+        .targets = .{ .all = true },
+    }};
+    const assignments = [_]orchestration.AcceleratorAssignment{.{
+        .deployment = "vision",
+        .revision = 2,
+        .device_ids = &.{"gpu:nvidia:a"},
+    }};
+    const desired: orchestration.DesiredState = .{
+        .node_id = "edge-01",
+        .generation = 1,
+        .deployments = &deployments,
+        .accelerator_assignments = &assignments,
+    };
+    try std.testing.expect(validDesiredReservations(desired, inventory));
+
+    var without_assignment = desired;
+    without_assignment.accelerator_assignments = &.{};
+    try std.testing.expect(validDesiredReservations(without_assignment, inventory));
+
+    var wrong_revision = assignments;
+    wrong_revision[0].revision = 1;
+    var invalid = desired;
+    invalid.accelerator_assignments = &wrong_revision;
+    try std.testing.expect(!validDesiredReservations(invalid, inventory));
+
+    var missing_device = assignments;
+    missing_device[0].device_ids = &.{"gpu:nvidia:missing"};
+    invalid.accelerator_assignments = &missing_device;
+    try std.testing.expect(!validDesiredReservations(invalid, inventory));
 }

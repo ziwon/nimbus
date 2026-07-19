@@ -9,6 +9,7 @@ const heartbeat = @import("heartbeat.zig");
 const identity = @import("identity.zig");
 const orchestration = @import("orchestration.zig");
 const reconciler = @import("reconciler.zig");
+const reservation = @import("reservation.zig");
 const runtime = @import("runtime.zig");
 const server = @import("server.zig");
 const storage = @import("storage.zig");
@@ -222,7 +223,14 @@ fn inspectAgent(init: std.process.Init, file_config: config.FileConfig, args: []
     const node_id = options.node_id orelse try identity.loadOrCreate(init, options.node_id_file);
     var inventory = try accelerator.collectSystem(init.gpa, init.io);
     defer inventory.deinit();
-    const value = heartbeat.collect(init, node_id, options.role, options.labels, inventory.report());
+    const value = heartbeat.collect(
+        init,
+        node_id,
+        options.role,
+        options.labels,
+        &.{heartbeat.feature_accelerator_requirements_v1},
+        inventory.report(),
+    );
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);
     try Io.File.stdout().writeStreamingAll(init.io, payload);
@@ -665,6 +673,7 @@ test {
     _ = identity;
     _ = orchestration;
     _ = reconciler;
+    _ = reservation;
     _ = runtime;
     _ = server;
     _ = storage;

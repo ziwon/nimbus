@@ -146,6 +146,19 @@ api-check port="18083" token="api-check-token": build
     ./zig-out/bin/nimbus agent run --once --id api-edge --server "http://127.0.0.1:$port"
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
     curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge" | grep -q '"accelerator_inventory"'
+
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data '{"schema_version":3,"node_id":"api-gpu","hostname":"api-gpu","role":"edge","features":["accelerator-requirements-v1"],"platform":{"os":"linux","arch":"x86_64","abi":"gnu"},"resources":{"cpu_count":8},"accelerator_inventory":{"schema_version":1,"status":"complete","accelerators":[{"id":"gpu:nvidia:fixture","kind":"gpu","vendor":"NVIDIA","model":"Fixture","source":"fixture","availability":"available","memory_total_bytes":8589934592,"driver_version":null,"runtimes":[],"capabilities":["fp16"]}],"probes":[{"name":"fixture","status":"ok","devices_found":1,"error_name":null}]},"timestamp_unix_ms":1000}' "http://127.0.0.1:$port/v1/heartbeat")" = 202
+    invalid_gpu='{"schema_version":1,"name":"gpu-invalid","revision":1,"runtime":{"kind":"process","command":["/bin/true"]},"resources":{"accelerators":{"count":0,"kind":"gpu"}},"targets":{"node_ids":["api-gpu"]}}'
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$invalid_gpu" "http://127.0.0.1:$port/v1/deployments/gpu-invalid")" = 400
+    gpu_a='{"schema_version":1,"name":"gpu-a","revision":1,"runtime":{"kind":"process","command":["/bin/true"]},"resources":{"accelerators":{"count":1,"kind":"gpu","vendor":"nvidia","memory_min_bytes":4294967296,"capabilities":["fp16"]}},"targets":{"node_ids":["api-gpu"]}}'
+    gpu_b='{"schema_version":1,"name":"gpu-b","revision":1,"runtime":{"kind":"process","command":["/bin/true"]},"resources":{"accelerators":{"count":1,"kind":"gpu","vendor":"nvidia","memory_min_bytes":4294967296,"capabilities":["fp16"]}},"targets":{"node_ids":["api-gpu"]}}'
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$gpu_a" "http://127.0.0.1:$port/v1/deployments/gpu-a")" = 202
+    test "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$gpu_b" "http://127.0.0.1:$port/v1/deployments/gpu-b")" = 202
+    gpu_desired=$(curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-gpu/desired-state")
+    printf '%s' "$gpu_desired" | grep -Fq '"accelerator_assignments":[{"deployment":"gpu-a"'
+    printf '%s' "$gpu_desired" | grep -Fq '"name":"gpu-b"'
+    ! printf '%s' "$gpu_desired" | grep -Fq '{"deployment":"gpu-b"'
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/gpu-b" | grep -Fq '"reason_code":"accelerator_capacity_exhausted"'
     kill "$server_pid"
     wait "$server_pid"
     server_pid=""
@@ -160,6 +173,8 @@ api-check port="18083" token="api-check-token": build
     test "$ready" = true
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-edge")" = 200
     test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-legacy")" = 200
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/nodes/api-gpu/desired-state" | grep -Fq '"accelerator_assignments":[{"deployment":"gpu-a"'
+    curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/deployments/gpu-b" | grep -Fq '"reason_code":"accelerator_capacity_exhausted"'
 
 # Run native end-to-end checks.
 integration: demo api-check orchestration-demo

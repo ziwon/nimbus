@@ -14,6 +14,29 @@ pub const Kind = enum {
     other,
 };
 
+pub const Requirement = struct {
+    count: u8 = 1,
+    kind: Kind,
+    vendor: ?[]const u8 = null,
+    memory_min_bytes: ?u64 = null,
+    capabilities: []const []const u8 = &.{},
+};
+
+pub const SelectionError = error{
+    OutOfMemory,
+    InvalidInventory,
+    InvalidRequirement,
+    InventoryPartial,
+    InventoryUnavailable,
+    KindMismatch,
+    DeviceUnavailable,
+    VendorMismatch,
+    MemoryMismatch,
+    CapabilityMismatch,
+    InsufficientDevices,
+    DeviceReserved,
+};
+
 pub const Availability = enum {
     available,
     degraded,
@@ -129,6 +152,129 @@ pub const InventoryReport = struct {
     accelerators: []const Device,
     probes: []const ProbeOutcome,
 };
+
+pub fn validateRequirement(requirement: Requirement) bool {
+    if (requirement.count == 0 or requirement.count > max_device_count or
+        requirement.capabilities.len > 32)
+        return false;
+    if (requirement.vendor) |vendor| {
+        if (!validOpaqueName(vendor, 64)) return false;
+    }
+    if (requirement.memory_min_bytes) |memory| {
+        if (memory == 0 or memory > std.math.maxInt(i64)) return false;
+    }
+    for (requirement.capabilities, 0..) |capability, index| {
+        if (!validOpaqueName(capability, 256)) return false;
+        for (requirement.capabilities[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, capability)) return false;
+        }
+    }
+    return true;
+}
+
+pub fn isValidDeviceId(value: []const u8) bool {
+    return validOpaqueName(value, 256);
+}
+
+/// Returns a caller-owned outer slice whose device ID strings borrow from the
+/// inventory. Selection is all-or-none and stable across inventory order.
+pub fn selectAlloc(
+    allocator: std.mem.Allocator,
+    inventory: InventoryReport,
+    requirement: Requirement,
+    reserved_ids: []const []const u8,
+) SelectionError![]const []const u8 {
+    if (!validateRequirement(requirement)) return error.InvalidRequirement;
+    if (inventory.accelerators.len > max_device_count) return error.InvalidInventory;
+    switch (inventory.status) {
+        .partial => return error.InventoryPartial,
+        .unavailable => return error.InventoryUnavailable,
+        .complete => {},
+    }
+
+    var kind_count: usize = 0;
+    var vendor_count: usize = 0;
+    var memory_count: usize = 0;
+    var compatible_count: usize = 0;
+    var available_count: usize = 0;
+    var candidates: [max_device_count][]const u8 = undefined;
+    var candidate_count: usize = 0;
+
+    for (inventory.accelerators) |device| {
+        if (device.kind != requirement.kind) continue;
+        kind_count += 1;
+        if (!vendorMatches(device, requirement)) continue;
+        vendor_count += 1;
+        if (!memoryMatches(device, requirement)) continue;
+        memory_count += 1;
+        if (!capabilitiesMatch(device, requirement)) continue;
+        compatible_count += 1;
+        if (device.availability != .available) continue;
+        available_count += 1;
+        if (containsId(reserved_ids, device.id)) continue;
+        candidates[candidate_count] = device.id;
+        candidate_count += 1;
+    }
+
+    if (kind_count == 0) return error.KindMismatch;
+    if (vendor_count == 0) return error.VendorMismatch;
+    if (memory_count == 0) return error.MemoryMismatch;
+    if (compatible_count == 0) return error.CapabilityMismatch;
+    if (compatible_count < requirement.count) return error.InsufficientDevices;
+    if (available_count < requirement.count) return error.DeviceUnavailable;
+    if (candidate_count < requirement.count) return error.DeviceReserved;
+
+    sortIds(candidates[0..candidate_count]);
+    return allocator.dupe([]const u8, candidates[0..requirement.count]);
+}
+
+pub fn matchesRequirement(device: Device, requirement: Requirement) bool {
+    return validateRequirement(requirement) and
+        device.kind == requirement.kind and
+        device.availability == .available and
+        vendorMatches(device, requirement) and
+        memoryMatches(device, requirement) and
+        capabilitiesMatch(device, requirement);
+}
+
+fn vendorMatches(device: Device, requirement: Requirement) bool {
+    const vendor = requirement.vendor orelse return true;
+    return std.ascii.eqlIgnoreCase(device.vendor, vendor);
+}
+
+fn memoryMatches(device: Device, requirement: Requirement) bool {
+    const minimum = requirement.memory_min_bytes orelse return true;
+    const total = device.memory_total_bytes orelse return false;
+    return total >= minimum;
+}
+
+fn capabilitiesMatch(device: Device, requirement: Requirement) bool {
+    for (requirement.capabilities) |required| {
+        var found = false;
+        for (device.capabilities) |available| {
+            if (!std.mem.eql(u8, required, available)) continue;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn containsId(ids: []const []const u8, target: []const u8) bool {
+    for (ids) |id| if (std.mem.eql(u8, id, target)) return true;
+    return false;
+}
+
+fn sortIds(ids: [][]const u8) void {
+    for (ids[1..], 1..) |id, index| {
+        var destination = index;
+        while (destination > 0 and std.mem.order(u8, id, ids[destination - 1]) == .lt) : (destination -= 1) {
+            ids[destination] = ids[destination - 1];
+        }
+        ids[destination] = id;
+    }
+}
 
 pub const ProbeDisposition = enum {
     supported,
@@ -1052,4 +1198,161 @@ test "wire validation accepts a bounded NVIDIA inventory" {
         .accelerators = &devices,
         .probes = &probes,
     }));
+}
+
+test "device selection is deterministic and all or none" {
+    const devices = [_]Device{
+        .{
+            .id = "gpu:nvidia:z",
+            .kind = .gpu,
+            .vendor = "NVIDIA",
+            .model = "L4",
+            .source = "fixture",
+            .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+            .capabilities = &.{ "fp16", "int8" },
+        },
+        .{
+            .id = "npu:acme:0",
+            .kind = .npu,
+            .vendor = "Acme",
+            .model = "NPU",
+            .source = "fixture",
+            .memory_total_bytes = 8 * 1024 * 1024 * 1024,
+            .capabilities = &.{"int8"},
+        },
+        .{
+            .id = "gpu:nvidia:a",
+            .kind = .gpu,
+            .vendor = "Nvidia",
+            .model = "A10",
+            .source = "fixture",
+            .memory_total_bytes = 16 * 1024 * 1024 * 1024,
+            .capabilities = &.{ "int8", "fp16" },
+        },
+    };
+    const requirement: Requirement = .{
+        .count = 2,
+        .kind = .gpu,
+        .vendor = "nvidia",
+        .memory_min_bytes = 8 * 1024 * 1024 * 1024,
+        .capabilities = &.{ "fp16", "int8" },
+    };
+    const selected = try selectAlloc(
+        std.testing.allocator,
+        .{ .status = .complete, .accelerators = &devices, .probes = &.{} },
+        requirement,
+        &.{},
+    );
+    defer std.testing.allocator.free(selected);
+
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    try std.testing.expectEqualStrings("gpu:nvidia:a", selected[0]);
+    try std.testing.expectEqualStrings("gpu:nvidia:z", selected[1]);
+    try std.testing.expect(matchesRequirement(devices[0], requirement));
+    try std.testing.expect(!matchesRequirement(devices[1], requirement));
+}
+
+test "device selection reports each requirement mismatch" {
+    const devices = [_]Device{
+        .{
+            .id = "gpu:nvidia:0",
+            .kind = .gpu,
+            .vendor = "NVIDIA",
+            .model = "L4",
+            .source = "fixture",
+            .memory_total_bytes = 24 * 1024 * 1024 * 1024,
+            .capabilities = &.{ "fp16", "int8" },
+        },
+        .{
+            .id = "gpu:amd:0",
+            .kind = .gpu,
+            .vendor = "AMD",
+            .model = "Fixture",
+            .source = "fixture",
+        },
+    };
+    const inventory: InventoryReport = .{
+        .status = .complete,
+        .accelerators = &devices,
+        .probes = &.{},
+    };
+
+    try std.testing.expectError(error.KindMismatch, selectAlloc(
+        std.testing.allocator,
+        inventory,
+        .{ .kind = .npu },
+        &.{},
+    ));
+    try std.testing.expectError(error.VendorMismatch, selectAlloc(
+        std.testing.allocator,
+        inventory,
+        .{ .kind = .gpu, .vendor = "Intel" },
+        &.{},
+    ));
+    try std.testing.expectError(error.MemoryMismatch, selectAlloc(
+        std.testing.allocator,
+        inventory,
+        .{ .kind = .gpu, .memory_min_bytes = 32 * 1024 * 1024 * 1024 },
+        &.{},
+    ));
+    try std.testing.expectError(error.CapabilityMismatch, selectAlloc(
+        std.testing.allocator,
+        inventory,
+        .{ .kind = .gpu, .capabilities = &.{"bf16"} },
+        &.{},
+    ));
+    try std.testing.expectError(error.InsufficientDevices, selectAlloc(
+        std.testing.allocator,
+        inventory,
+        .{ .count = 3, .kind = .gpu },
+        &.{},
+    ));
+
+    var unavailable_devices = devices;
+    unavailable_devices[0].availability = .degraded;
+    try std.testing.expectError(error.DeviceUnavailable, selectAlloc(
+        std.testing.allocator,
+        .{ .status = .complete, .accelerators = &unavailable_devices, .probes = &.{} },
+        .{ .kind = .gpu, .vendor = "nvidia" },
+        &.{},
+    ));
+}
+
+test "device selection fails closed for reservations and incomplete inventory" {
+    const devices = [_]Device{.{
+        .id = "gpu:nvidia:0",
+        .kind = .gpu,
+        .vendor = "NVIDIA",
+        .model = "L4",
+        .source = "fixture",
+    }};
+    const complete: InventoryReport = .{
+        .status = .complete,
+        .accelerators = &devices,
+        .probes = &.{},
+    };
+    const requirement: Requirement = .{ .kind = .gpu };
+
+    try std.testing.expectError(error.DeviceReserved, selectAlloc(
+        std.testing.allocator,
+        complete,
+        requirement,
+        &.{"gpu:nvidia:0"},
+    ));
+    var partial = complete;
+    partial.status = .partial;
+    try std.testing.expectError(error.InventoryPartial, selectAlloc(
+        std.testing.allocator,
+        partial,
+        requirement,
+        &.{},
+    ));
+    var unavailable = complete;
+    unavailable.status = .unavailable;
+    try std.testing.expectError(error.InventoryUnavailable, selectAlloc(
+        std.testing.allocator,
+        unavailable,
+        requirement,
+        &.{},
+    ));
 }

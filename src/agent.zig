@@ -35,7 +35,16 @@ pub fn run(init: std.process.Init, options: Options) !void {
     shutdown.install();
     var backoff = options.retry_initial_seconds;
     while (!shutdown.isRequested()) {
-        const sent = sendOnce(init, endpoint, options) catch |err| blk: {
+        var inventory = accelerator.collectSystem(init.gpa, init.io) catch |err| {
+            try log(init, "accelerator inventory failed: {t}; retrying in {d}s\n", .{ err, backoff });
+            if (options.once) return err;
+            try shutdown.sleepInterruptible(init.io, backoff *| 1000);
+            backoff = nextBackoff(backoff, options.retry_max_seconds);
+            continue;
+        };
+        defer inventory.deinit();
+        const inventory_report = inventory.report();
+        const sent = sendOnce(init, endpoint, options, inventory_report) catch |err| blk: {
             try log(init, "heartbeat failed: {t}; retrying in {d}s\n", .{ err, backoff });
             break :blk false;
         };
@@ -48,6 +57,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
                     .node_id = options.node_id,
                     .token = options.token,
                     .runtime_options = options.runtime_options,
+                    .accelerator_inventory = inventory_report,
                 }) catch |err| try log(init, "reconciliation failed: {t}\n", .{err});
             }
             if (options.once) return;
@@ -62,15 +72,19 @@ pub fn run(init: std.process.Init, options: Options) !void {
     try log(init, "shutdown requested; agent stopped\n", .{});
 }
 
-fn sendOnce(init: std.process.Init, endpoint: []const u8, options: Options) !bool {
-    var inventory = try accelerator.collectSystem(init.gpa, init.io);
-    defer inventory.deinit();
+fn sendOnce(
+    init: std.process.Init,
+    endpoint: []const u8,
+    options: Options,
+    inventory: accelerator.InventoryReport,
+) !bool {
     const value = heartbeat.collect(
         init,
         options.node_id,
         options.role,
         options.labels,
-        inventory.report(),
+        &.{heartbeat.feature_accelerator_requirements_v1},
+        inventory,
     );
     const payload = try heartbeat.serializeAlloc(init.gpa, value);
     defer init.gpa.free(payload);

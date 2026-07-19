@@ -314,7 +314,9 @@ fn ingestDeployment(
     if (!orchestration.validateDeployment(parsed.value))
         return respondJson(request, "{\"error\":\"invalid_deployment\"}\n", .bad_request);
 
-    const canonical = try std.json.Stringify.valueAlloc(init.gpa, parsed.value, .{});
+    const canonical = try std.json.Stringify.valueAlloc(init.gpa, parsed.value, .{
+        .emit_null_optional_fields = false,
+    });
     defer init.gpa.free(canonical);
     const now = Io.Clock.real.now(init.io).toMilliseconds();
     registry.applyDeployment(parsed.value, canonical, now) catch |err| switch (err) {
@@ -419,13 +421,38 @@ fn validHeartbeat(value: heartbeat.Heartbeat) bool {
         }
     }
     return switch (value.schema_version) {
-        1 => value.accelerator_inventory == null,
-        heartbeat.current_schema_version => if (value.accelerator_inventory) |inventory|
-            accelerator.validateReport(inventory)
-        else
-            false,
+        1 => value.accelerator_inventory == null and value.features.len == 0,
+        2 => value.features.len == 0 and validAcceleratorInventory(value.accelerator_inventory),
+        heartbeat.current_schema_version => validFeatures(value.features) and
+            validAcceleratorInventory(value.accelerator_inventory),
         else => false,
     };
+}
+
+fn validAcceleratorInventory(inventory: ?accelerator.InventoryReport) bool {
+    return if (inventory) |report| accelerator.validateReport(report) else false;
+}
+
+fn validFeatures(features: []const []const u8) bool {
+    if (features.len > heartbeat.max_feature_count) return false;
+    for (features, 0..) |feature, index| {
+        if (!validFeature(feature)) return false;
+        for (features[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, feature)) return false;
+        }
+    }
+    return true;
+}
+
+fn validFeature(feature: []const u8) bool {
+    if (feature.len == 0 or feature.len > heartbeat.max_feature_name_length or
+        !std.ascii.isAlphanumeric(feature[0]) or
+        !std.ascii.isAlphanumeric(feature[feature.len - 1])) return false;
+    for (feature) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.'))
+            return false;
+    }
+    return true;
 }
 
 fn isAuthorized(request: *const std.http.Server.Request, token: ?[]const u8) bool {
@@ -472,7 +499,7 @@ fn respondJson(request: *std.http.Server.Request, body: []const u8, status: std.
 
 test "heartbeat validation rejects unsupported schemas" {
     const value: heartbeat.Heartbeat = .{
-        .schema_version = 3,
+        .schema_version = 4,
         .node_id = "edge-01",
         .hostname = "edge-01",
         .role = "edge",
@@ -494,10 +521,27 @@ test "heartbeat validation accepts version one during rolling upgrades" {
         .timestamp_unix_ms = 1000,
     };
     try std.testing.expect(validHeartbeat(value));
+
+    var with_features = value;
+    with_features.features = &.{heartbeat.feature_accelerator_requirements_v1};
+    try std.testing.expect(!validHeartbeat(with_features));
+
+    var with_inventory = value;
+    with_inventory.accelerator_inventory = .{
+        .status = .complete,
+        .accelerators = &.{},
+        .probes = &.{.{
+            .name = "nvidia-smi",
+            .status = .not_present,
+            .devices_found = 0,
+        }},
+    };
+    try std.testing.expect(!validHeartbeat(with_inventory));
 }
 
 test "heartbeat validation requires inventory in version two" {
     const value: heartbeat.Heartbeat = .{
+        .schema_version = 2,
         .node_id = "edge-v2",
         .hostname = "edge-v2",
         .role = "edge",
@@ -508,8 +552,9 @@ test "heartbeat validation requires inventory in version two" {
     try std.testing.expect(!validHeartbeat(value));
 }
 
-test "heartbeat validation distinguishes CPU-only from unavailable inventory" {
+test "heartbeat version two accepts inventory but rejects features" {
     const base: heartbeat.Heartbeat = .{
+        .schema_version = 2,
         .node_id = "edge-v2",
         .hostname = "edge-v2",
         .role = "edge",
@@ -528,6 +573,10 @@ test "heartbeat validation distinguishes CPU-only from unavailable inventory" {
     };
     try std.testing.expect(validHeartbeat(base));
 
+    var with_features = base;
+    with_features.features = &.{heartbeat.feature_accelerator_requirements_v1};
+    try std.testing.expect(!validHeartbeat(with_features));
+
     var unavailable = base;
     unavailable.accelerator_inventory = .{
         .status = .unavailable,
@@ -540,6 +589,52 @@ test "heartbeat validation distinguishes CPU-only from unavailable inventory" {
         }},
     };
     try std.testing.expect(validHeartbeat(unavailable));
+}
+
+test "heartbeat version three validates bounded unique features" {
+    const base: heartbeat.Heartbeat = .{
+        .node_id = "edge-v3",
+        .hostname = "edge-v3",
+        .role = "edge",
+        .features = &.{
+            heartbeat.feature_accelerator_requirements_v1,
+            "local-reservations-v1",
+        },
+        .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
+        .resources = .{ .cpu_count = 4 },
+        .accelerator_inventory = .{
+            .status = .complete,
+            .accelerators = &.{},
+            .probes = &.{.{
+                .name = "nvidia-smi",
+                .status = .not_present,
+                .devices_found = 0,
+            }},
+        },
+        .timestamp_unix_ms = 1000,
+    };
+    try std.testing.expect(validHeartbeat(base));
+
+    var missing_inventory = base;
+    missing_inventory.accelerator_inventory = null;
+    try std.testing.expect(!validHeartbeat(missing_inventory));
+
+    var duplicate = base;
+    duplicate.features = &.{
+        heartbeat.feature_accelerator_requirements_v1,
+        heartbeat.feature_accelerator_requirements_v1,
+    };
+    try std.testing.expect(!validHeartbeat(duplicate));
+
+    var invalid = base;
+    invalid.features = &.{"accelerator requirements v1"};
+    try std.testing.expect(!validHeartbeat(invalid));
+
+    const too_many: [heartbeat.max_feature_count + 1][]const u8 =
+        @splat(heartbeat.feature_accelerator_requirements_v1);
+    var unbounded = base;
+    unbounded.features = &too_many;
+    try std.testing.expect(!validHeartbeat(unbounded));
 }
 
 test "node orchestration subresources reject nested identifiers" {

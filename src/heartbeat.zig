@@ -3,7 +3,10 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const accelerator = @import("accelerator.zig");
 
-pub const current_schema_version: u8 = 2;
+pub const current_schema_version: u8 = 3;
+pub const max_feature_count: usize = 16;
+pub const max_feature_name_length: usize = 64;
+pub const feature_accelerator_requirements_v1 = "accelerator-requirements-v1";
 
 pub const Heartbeat = struct {
     schema_version: u8 = current_schema_version,
@@ -11,6 +14,7 @@ pub const Heartbeat = struct {
     hostname: []const u8,
     role: []const u8,
     labels: []const Label = &.{},
+    features: []const []const u8 = &.{},
     platform: Platform,
     resources: Resources,
     accelerator_inventory: ?accelerator.InventoryReport = null,
@@ -38,6 +42,7 @@ pub fn collect(
     node_id: []const u8,
     role: []const u8,
     labels: []const Label,
+    features: []const []const u8,
     accelerator_inventory: accelerator.InventoryReport,
 ) Heartbeat {
     const hostname = detectHostname(init);
@@ -47,6 +52,7 @@ pub fn collect(
         .hostname = hostname,
         .role = role,
         .labels = labels,
+        .features = features,
         .platform = .{
             .os = @tagName(builtin.target.os.tag),
             .arch = @tagName(builtin.target.cpu.arch),
@@ -84,6 +90,7 @@ test "heartbeat JSON contains portable target metadata" {
         .role = "edge",
         .platform = .{ .os = "linux", .arch = "aarch64", .abi = "musl" },
         .resources = .{ .cpu_count = 4 },
+        .features = &.{feature_accelerator_requirements_v1},
         .accelerator_inventory = .{
             .status = .complete,
             .accelerators = &.{},
@@ -101,5 +108,6 @@ test "heartbeat JSON contains portable target metadata" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"node_id\":\"edge-01\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"arch\":\"aarch64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, feature_accelerator_requirements_v1) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"accelerator_inventory\"") != null);
 }
