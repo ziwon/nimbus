@@ -8,6 +8,9 @@
 Nimbus is a lightweight Zig control plane and agent for operating heterogeneous
 edge AI, intermediary, server, and cloud nodes. One binary provides:
 
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/5ae38dda-3dba-4f2e-83ea-72804108003f" />
+
+
 - a long-running agent with stable on-disk identity;
 - interval, jitter, exponential retry, and graceful POSIX shutdown;
 - labels and roles for targeting glasses, drones, vehicles, desktops, and servers;
