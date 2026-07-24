@@ -129,39 +129,50 @@ applicable. Run `just --show RECIPE` to inspect the exact command before use.
 
 ## Configuration
 
-Every operational command accepts a JSON configuration file with `--config`:
+YAML is the default format for human-authored node configuration. Every
+operational command accepts it with `--config`; use
+[`examples/config/agent.yaml`](examples/config/agent.yaml) as the starting
+point for deployed agents.
 
-```json
-{
-  "server": "http://127.0.0.1:8080",
-  "role": "smart-class",
-  "labels": ["site=school-a", "device=desktop", "accelerator=jetson"],
-  "node_id_file": "/var/lib/nimbus/node-id",
-  "interval_seconds": 30,
-  "jitter_seconds": 5,
-  "retry_initial_seconds": 1,
-  "retry_max_seconds": 30,
-  "orchestration": true,
-  "state_dir": "/var/lib/nimbus/state",
-  "runtimes": "systemd,docker,containerd",
-  "artifact_public_key": "HEX_ENCODED_ED25519_PUBLIC_KEY",
-  "require_artifact_signatures": true,
-  "max_artifact_bytes": 8589934592,
-  "artifact_cache_bytes": 17179869184,
-  "connectivity_quality_percent": 100,
-  "power_source": "mains",
-  "power_budget_milliwatts": 30000,
-  "cost_microunits_per_hour": 0,
-  "token_file": "/run/secrets/nimbus-node-token",
-  "admin_token_file": "/run/secrets/nimbus-admin-token",
-  "node_token_dir": "/run/secrets/nimbus-node-tokens",
-  "bind": "127.0.0.1",
-  "port": 8080,
-  "database": "nimbus.db",
-  "stale_after_seconds": 90,
-  "allow_insecure_no_auth": false
-}
+```yaml
+server: http://127.0.0.1:8080
+role: smart-class
+labels:
+  - site=school-a
+  - device=desktop
+  - accelerator=jetson
+node_id_file: /var/lib/nimbus/node-id
+interval_seconds: 30
+jitter_seconds: 5
+retry_initial_seconds: 1
+retry_max_seconds: 30
+orchestration: true
+state_dir: /var/lib/nimbus/state
+runtimes: systemd,docker,containerd
+artifact_public_key: HEX_ENCODED_ED25519_PUBLIC_KEY
+require_artifact_signatures: true
+max_artifact_bytes: 8589934592
+artifact_cache_bytes: 17179869184
+connectivity_quality_percent: 100
+power_source: mains
+power_budget_milliwatts: 30000
+cost_microunits_per_hour: 0
+token_file: /run/secrets/nimbus-node-token
+admin_token_file: /run/secrets/nimbus-admin-token
+node_token_dir: /run/secrets/nimbus-node-tokens
+bind: 127.0.0.1
+port: 8080
+database: nimbus.db
+stale_after_seconds: 90
+allow_insecure_no_auth: false
 ```
+
+The YAML reader intentionally supports this flat schema: scalar values and the
+`labels` list. It does not interpret YAML tags, anchors, or aliases, and rejects
+nested mappings and multiline values, avoiding implicit YAML type conversions.
+Quote a scalar when it must remain a string. JSON configuration files remain
+fully supported for automation and existing installations; both formats are
+converted to the same strict schema, so unknown fields and type mismatches fail.
 
 Precedence is command-line option, environment variable, configuration file,
 then built-in default. Supported environment variables include:
@@ -182,6 +193,8 @@ then built-in default. Supported environment variables include:
 
 Use separate configuration files for the server/operator and agent in real
 deployments so the administrative token is never copied to managed nodes.
+The packaged systemd unit reads `/etc/nimbus/agent.yaml`; environment variables
+in `/etc/nimbus/nimbus.env` remain available as higher-precedence overrides.
 
 ## HTTP API
 

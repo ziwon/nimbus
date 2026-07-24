@@ -82,7 +82,7 @@ src/accelerator_reconciler.zig Fenced accelerator state machine
 src/accelerator_runtime.zig   Exact CDI and host runtime adapters
 src/artifact_cache.zig        Bounded content-addressed cache and active pins
 src/client.zig                HTTP client operations
-src/config.zig                JSON and environment configuration
+src/config.zig                YAML/JSON and environment configuration
 src/heartbeat.zig             Heartbeat schema and local collection
 src/identity.zig              Stable node identity
 src/orchestration.zig         Desired-state types and validation
@@ -223,7 +223,7 @@ discovery path and `just orchestration-demo` for the Linux process-runtime path.
 Configuration precedence is:
 
 ```text
-CLI > environment > JSON file > built-in default
+CLI > environment > YAML or JSON file > built-in default
 ```
 
 When adding a configuration field:
@@ -232,7 +232,7 @@ When adding a configuration field:
 2. Define the environment-variable behavior in `main.zig` if appropriate.
 3. Apply the file/env value before parsing CLI overrides.
 4. Validate numeric ranges and incompatible combinations.
-5. Add or update tests for strict JSON parsing.
+5. Add or update tests for strict YAML and JSON parsing.
 6. Update the configuration example in the project README.
 7. Add a `justfile` default only when the recipe exposes that option.
 

@@ -1,0 +1,16 @@
+# Copy to /etc/nimbus/agent.yaml for a managed node, then set the endpoint,
+# role, labels, and token-file path for that node.
+server: https://control-plane.example:8080
+role: edge
+labels:
+  - site=school-a
+  - device=desktop
+node_id_file: /var/lib/nimbus/node-id
+interval_seconds: 30
+jitter_seconds: 5
+retry_initial_seconds: 1
+retry_max_seconds: 30
+orchestration: true
+state_dir: /var/lib/nimbus/state
+runtimes: systemd,docker,containerd
+token_file: /run/secrets/nimbus-node-token

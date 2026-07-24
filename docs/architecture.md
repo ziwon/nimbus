@@ -100,7 +100,7 @@ changing protocol types.
 ```mermaid
 flowchart TB
     Main[main.zig<br/>CLI and precedence]
-    Config[config.zig<br/>strict JSON/env]
+    Config[config.zig<br/>strict YAML/JSON/env]
     Identity[identity.zig<br/>node identity]
     Heartbeat[heartbeat.zig<br/>inventory and labels]
     Accelerator[accelerator.zig<br/>bounded hardware probes]
@@ -174,10 +174,12 @@ flowchart TB
 Configuration precedence is consistent across commands:
 
 ```text
-CLI > environment > JSON configuration file > built-in default
+CLI > environment > YAML or JSON configuration file > built-in default
 ```
 
-JSON rejects unknown fields. Strings are copied into process-lifetime storage
+YAML and JSON reject unknown fields. YAML is limited to the flat configuration
+schema (scalars plus the `labels` list), then parsed through the same strict
+schema as JSON. Strings are copied into process-lifetime storage
 before the input buffer is released. Agent labels are validated and duplicate
 keys are rejected.
 
